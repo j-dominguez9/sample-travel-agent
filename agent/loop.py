@@ -1,23 +1,76 @@
 import json
-from typing import cast
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
+from typing import Any
 
 import anthropic
-from openinference.instrumentation import OITracer
 from opentelemetry import trace
 
 from agent.config import MAX_TOKENS, MODEL
-from agent.prompt import SYSTEM_PROMPT
+from agent.prompt import system_prompt
 from agent.tools import TOOLS, execute_tool
 
 client = anthropic.Anthropic()
 
-# `trace.get_tracer` is typed as returning a plain OTel Tracer, but Phoenix's
-# `register()` installs an OpenInference provider globally, so what this
-# actually resolves to at span-creation time is an OITracer — the thing that
-# accepts `openinference_span_kind` and yields spans with set_input/set_output.
-# The cast states that contract instead of hiding it behind a blanket ignore:
-# if the tracer wiring ever changes, this line is where to look.
-tracer = cast(OITracer, trace.get_tracer("travel-agent"))
+
+@contextmanager
+def _tool_span(name: str, tool_input: Any) -> Iterator[Any]:
+    """Span for one tool call, with the OpenInference extras when available.
+
+    Tracing must stay optional. Phoenix's `register()` installs a provider whose
+    tracer accepts `openinference_span_kind` and yields spans with set_input and
+    set_output; with no provider installed — the CLI, a unit test, anyone who
+    hasn't configured Phoenix — the same call resolves to a NoOpTracer that
+    rejects those and raises. The agent must not depend on its observability
+    stack being wired up to answer a question, so this degrades to a plain span
+    instead of failing.
+    """
+    tracer = trace.get_tracer("travel-agent")
+    with ExitStack() as stack:
+        try:
+            # ProxyTracer is lazy: it builds the context manager without
+            # complaint and only delegates on __enter__, so the unsupported
+            # kwarg surfaces there rather than at the call. Entering through
+            # ExitStack is what puts the failure somewhere catchable.
+            span = stack.enter_context(
+                tracer.start_as_current_span(name, openinference_span_kind="tool")
+            )
+        except TypeError:
+            span = stack.enter_context(tracer.start_as_current_span(name))
+
+        _record(span, "set_input", tool_input)
+        yield span
+
+
+def _record(span: Any, method: str, value: Any) -> None:
+    """Attach an OpenInference attribute when the span can carry one.
+
+    Two independent things have to hold, and checking only the first is how
+    this broke: the tracer must accept OpenInference kwargs, AND the span it
+    returns must be recording. With a provider installed but no exporter — a
+    pytest run with tracing switched off — the tracer is a real OITracer that
+    happily accepts `openinference_span_kind`, yet hands back an
+    OpenInferenceSpan wrapping a NonRecordingSpan. That object *has*
+    `set_input`; calling it raises "Cannot set input attributes on a
+    non-OpenInference span", because the kind attribute was never stored.
+
+    A non-recording span discards attributes anyway, so skipping is free.
+    """
+    if not getattr(span, "is_recording", lambda: False)():
+        return
+    setter = getattr(span, method, None)
+    if setter is None:
+        return
+    try:
+        setter(value)
+    except ValueError:
+        # The span is recording but not OpenInference-flavoured. Tracing is a
+        # side effect; it must never take down the turn it is observing.
+        pass
+
+
+def _record_output(span: Any, result: Any) -> None:
+    _record(span, "set_output", result)
 
 
 def run_agent(messages: list) -> tuple[str, list]:
@@ -30,7 +83,7 @@ def run_agent(messages: list) -> tuple[str, list]:
         response = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
+            system=system_prompt(),
             tools=TOOLS,
             messages=messages,
         )
@@ -42,12 +95,9 @@ def run_agent(messages: list) -> tuple[str, list]:
         tool_results = []
         for block in response.content:
             if block.type == "tool_use":
-                with tracer.start_as_current_span(
-                    block.name, openinference_span_kind="tool"
-                ) as span:
-                    span.set_input(block.input)
+                with _tool_span(block.name, block.input) as span:
                     result = execute_tool(block.name, block.input)
-                    span.set_output(result)
+                    _record_output(span, result)
                 tool_results.append(
                     {
                         "type": "tool_result",

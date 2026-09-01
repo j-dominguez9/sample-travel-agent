@@ -1,11 +1,16 @@
 """System prompts, versioned so an A/B is reproducible.
 
-Select with PROMPT_VERSION=v1|v2 (default v2). v1 is the prompt the agent
-shipped with; v2 is the first change driven by the eval loop rather than by
-reading code — see `evals/` and the no_internal_leak evaluator.
+Select with PROMPT_VERSION=v1|v2|v3|v4 (default v4). v1 is the prompt the agent
+shipped with; every later version is a change driven by the eval loop rather
+than by reading code:
+
+  v2  no_internal_leak — stop narrating the lookup on no-result turns
+  v3  grounding — state only fields the tools actually return
+  v4  today's date plus a calendar, so relative dates resolve
 """
 
 import os
+from datetime import UTC, datetime, timedelta
 
 V1 = """Help Book Travel.
 
@@ -52,7 +57,58 @@ Only state facts that appear in the tool results:
 - If the user asks about something the tools don't cover, say you don't have that detail and offer what you can check instead.
 """
 
-_VERSIONS = {"v1": V1, "v2": V2, "v3": V3}
+# v4 tells the agent what day it is. Production monitoring found four of nine
+# no-result turns failing graceful_alternative, all with one root cause: the
+# agent cannot resolve "next Tuesday", "this weekend" or "next Friday", so it
+# hands the work back to the user — while the prompt above tells it not to ask
+# clarifying questions. It was also inventing example dates from 2024, two years
+# stale, because it had no anchor at all.
+V4 = V3 + """
+Today is {today}.
 
-PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v3")
-SYSTEM_PROMPT = _VERSIONS[PROMPT_VERSION]
+{calendar}
+
+Resolve relative dates yourself — "next Friday", "this weekend", "next month" —
+and pass the resolved YYYY-MM-DD date to the tools. Use the calendar above
+rather than counting days in your head. Say which date you used so the user can
+correct you. Only ask for a date when the request is genuinely ambiguous about
+which one is meant.
+"""
+
+_VERSIONS = {"v1": V1, "v2": V2, "v3": V3, "v4": V4}
+
+PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v4")
+
+
+def system_prompt() -> str:
+    """The prompt for one turn, with today's date filled in.
+
+    Resolved per request rather than at import: a server that has been up for
+    days would otherwise tell every user it is still the day it booted, which is
+    a worse failure than not knowing the date at all — confidently wrong instead
+    of visibly uncertain.
+    """
+    template = _VERSIONS[PROMPT_VERSION]
+    if "{today}" not in template:
+        return template
+    today = datetime.now(UTC).date()
+    # A lookup table rather than an instruction to calculate. Given only the
+    # date, the model resolved "next Friday" to a Saturday and called Sunday
+    # "Saturday" — it cannot do weekday arithmetic reliably, but it reads a
+    # table perfectly. Deterministic work belongs outside the model, and two
+    # weeks covers every relative date these queries actually use.
+    calendar = "\n".join(
+        f"  {(today + timedelta(days=i)).isoformat()} is a "
+        f"{(today + timedelta(days=i)).strftime('%A')}"
+        for i in range(15)
+    )
+    return template.format(
+        today=f"{today.isoformat()}, a {today.strftime('%A')}", calendar=calendar
+    )
+
+
+#: The rendered prompt, for callers that want the text without calling through.
+#: Must be the rendered form: from v4 the raw template carries unsubstituted
+#: `{today}` / `{calendar}` placeholders, so exposing it raw would hand a caller
+#: a prompt that reads literally "Today is {today}".
+SYSTEM_PROMPT = system_prompt()

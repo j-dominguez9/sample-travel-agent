@@ -93,14 +93,18 @@ def resolve(client, dataset_id: str, name: str) -> str:
     return str(_g(matches[-1], "id"))
 
 
-def load(client, dataset_id: str, name: str):
-    """Return (scores, run->example) with one entry per *run*, not per example.
+def load_by_id(client, experiment_id: str):
+    """Return (scores, run->example) for one experiment, addressed by id.
 
-    Keying by example id would collapse `repetitions=N` down to a single
-    observation per example and silently throw away the rest — which is exactly
-    the noise the repetitions were added to average out.
+    Addressing by id matters wherever two experiments can share a name — a task
+    retry or a same-day re-trigger produces exactly that, and resolving by name
+    would silently pick the wrong one.
+
+    Scores are keyed per *run*, not per example: keying by example would
+    collapse `repetitions=N` to a single observation and silently discard the
+    rest, which is the noise the repetitions exist to average out.
     """
-    exp = client.experiments.get_experiment(experiment_id=resolve(client, dataset_id, name))
+    exp = client.experiments.get_experiment(experiment_id=experiment_id)
     run_example = {_g(r, "id"): _g(r, "dataset_example_id") for r in exp["task_runs"]}
     scores: dict[tuple[str, str], float] = {}
     for e in exp["evaluation_runs"]:
@@ -111,6 +115,11 @@ def load(client, dataset_id: str, name: str):
             _g(res, "score") or 0.0
         )
     return scores, run_example
+
+
+def load(client, dataset_id: str, name: str):
+    """Same, addressed by experiment name."""
+    return load_by_id(client, resolve(client, dataset_id, name))
 
 
 def main() -> None:
