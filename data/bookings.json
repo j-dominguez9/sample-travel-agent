@@ -1,0 +1,20 @@
+{
+  "bookings": [
+    {"reference": "PLM4TQ", "passenger": "J. Okafor", "origin": "New York", "destination": "Miami",
+     "date": "2026-10-14", "fare_class": "Economy Saver", "status": "Confirmed"},
+    {"reference": "RX9VBD", "passenger": "A. Lindqvist", "origin": "London", "destination": "Paris",
+     "date": "2026-09-28", "fare_class": "Flexible", "status": "Confirmed"},
+    {"reference": "KT2WHN", "passenger": "S. Mehta", "origin": "Tokyo", "destination": "Los Angeles",
+     "date": "2026-11-02", "fare_class": "Business", "status": "Cancelled"},
+    {"reference": "ZB7LGC", "passenger": "M. Duarte", "origin": "Chicago", "destination": "Denver",
+     "date": "2026-09-19", "fare_class": "Economy Saver", "status": "Confirmed"}
+  ],
+  "policies": [
+    {"fare_class": "Economy Saver", "refundable": false, "change_fee_usd": 120,
+     "notes": "Changes permitted up to 24 hours before departure. No refunds."},
+    {"fare_class": "Flexible", "refundable": true, "change_fee_usd": 0,
+     "notes": "Free changes and full refund up to 2 hours before departure."},
+    {"fare_class": "Business", "refundable": true, "change_fee_usd": 50,
+     "notes": "Refundable less a service fee. Changes free within 7 days of booking."}
+  ]
+}

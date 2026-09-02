@@ -189,8 +189,12 @@ def report(config: Any, *, since_minutes: int | None = None,
            endpoint: str | None = None) -> CostReport:
     """Build a cost report for one agent from its config."""
     settings = getattr(config, "cost", None) or {}
-    window = since_minutes or int(
-        config.monitoring.get("window_minutes", 60)
+    # `is None`, not truthiness: `--window 0` is a request for a zero-length
+    # window, not an absent argument, and silently substituting the config
+    # value would report a different window than the one asked for.
+    window = (
+        int(config.monitoring.get("window_minutes", 60))
+        if since_minutes is None else since_minutes
     )
     projects = fetch_projects(since_minutes=window, endpoint=endpoint)
 

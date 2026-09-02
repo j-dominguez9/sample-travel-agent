@@ -11,13 +11,18 @@ from common.redaction import RedactingSpanExporter
 logger = logging.getLogger(__name__)
 
 
-def configure_tracing() -> TracerProvider:
-    """Otel for phoenix observability platform."""
+def configure_tracing(project_name: str = "travel-agent") -> TracerProvider:
+    """Otel for phoenix observability platform.
+
+    `project_name` is a parameter because agent two traces to its own project.
+    Keeping tenants in separate Phoenix projects is what lets cost, thresholds
+    and sweeps be per-agent without any of them filtering the others out.
+    """
 
     if not os.getenv("PHOENIX_COLLECTOR_ENDPOINT"):
         raise KeyError("PHOENIX_COLLECTOR_ENDPOINT envvar not set.")
     tracer_provider = register(
-        project_name="travel-agent", auto_instrument=True, batch=True
+        project_name=project_name, auto_instrument=True, batch=True
     )
 
     # Every span leaves through here, including the ones the Anthropic

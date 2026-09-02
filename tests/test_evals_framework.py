@@ -809,3 +809,191 @@ def test_a_project_with_no_traces_is_named_not_silently_zeroed() -> None:
     """Under-reporting the bill is the one failure a cost view must not have."""
     r = _cost_report(missing_projects=["evaluators"])
     assert "'evaluators' has no traces" in r.summary()
+
+
+# --------------------------------------------------------------------------
+# multi-tenancy
+#
+# The customer's requirement was "one of many agents this year". These pin the
+# properties that make that true, because every one of them was violated by
+# code that looked fine while there was only one agent.
+# --------------------------------------------------------------------------
+
+def test_both_agents_are_discovered_from_config_alone() -> None:
+    """Onboarding is a directory and a config file, not a code change."""
+    found = {c.agent for c in agent_config.discover()}
+    assert {"travel", "support"} <= found
+
+
+def test_agent_modules_load_by_name_not_by_hardcoded_import() -> None:
+    """The DAGs used to `from evals.agents.travel import evaluators`.
+
+    With two agents that is silently wrong: the support DAG would register the
+    travel agent's evaluators, ask the registry for `support`, find nothing and
+    score zero turns — no error, a green run, and no annotations.
+    """
+    from evals.core import agents as agent_modules
+
+    for name in ("travel", "support"):
+        modules = agent_modules.load(name)
+        assert modules.evaluators.__name__ == f"evals.agents.{name}.evaluators"
+        assert REGISTRY.for_agent(name), f"{name} registered no evaluators"
+
+
+def test_optional_agent_modules_may_be_absent() -> None:
+    """An agent with no judges or no computable ground truth is legitimate."""
+    from evals.core import agents as agent_modules
+
+    assert agent_modules.load("support").truth is None
+    assert agent_modules.load("travel").truth is not None
+
+
+def test_each_agent_only_sees_its_own_evaluators() -> None:
+    travel = {r.name for r in REGISTRY.for_agent("travel")}
+    support = {r.name for r in REGISTRY.for_agent("support")}
+    assert "flight_direction" in travel and "flight_direction" not in support
+    assert "fees_match_policy" in support and "fees_match_policy" not in travel
+    # The genuinely domain-independent ones are shared by name, from one
+    # implementation in evals/core/library.py rather than two copies.
+    assert {"no_unredacted_pii", "hallucination", "tool_response_handling"} <= travel & support
+
+
+def test_curation_falls_back_to_review_for_an_agent_with_no_truth_hook() -> None:
+    """Deriving ground truth is per-agent; not having it must not guess.
+
+    `derive_expected` used to branch on `search_flights` directly, so a second
+    agent's candidates would have been labelled by travel logic or silently
+    mislabelled. Absent a hook, every candidate needs a human.
+    """
+    record = turn("s1", "Cancel PLM4TQ",
+                  [{"name": "lookup_booking", "input": {"reference": "PLM4TQ"},
+                    "output": {"reference": "PLM4TQ", "status": "Confirmed"}}])
+    expected, needs_review, _ = curate.derive_expected(record, None)
+    assert needs_review
+    assert expected["expected_tool"] == "lookup_booking"
+
+
+def test_the_triage_prompt_describes_the_agent_it_is_triaging() -> None:
+    """It used to hardcode the travel agent's four tools.
+
+    Agent two's failures would have been explained against a description of a
+    different product, which is worse than no description at all.
+    """
+    confs = {c.agent: c for c in agent_config.discover()}
+    assert "lookup_booking" in confs["support"].description
+    assert "search_flights" in confs["travel"].description
+    assert "search_flights" not in diagnose.HYPOTHESIS_PROMPT
+    assert "{agent_brief}" in diagnose.HYPOTHESIS_PROMPT
+
+
+# --------------------------------------------------------------------------
+# support agent: fabricated references
+# --------------------------------------------------------------------------
+
+def _ref_case(reply: str, message: str, lookups: list[tuple[str, dict]]) -> float:
+    from evals.agents.support.evaluators import no_fabricated_reference
+    calls = [{"name": "lookup_booking", "input": {"reference": r}, "output": o}
+             for r, o in lookups]
+    return no_fabricated_reference.evaluate(
+        {"input": {"message": message}, "output": {"reply": reply, "tool_calls": calls}}
+    )[0].score
+
+
+def test_a_reference_the_model_invented_is_not_grounded_by_looking_it_up() -> None:
+    """Seeding from the tool *input* let a fabrication launder itself.
+
+    The model writes a reference, calls the tool with it, gets an error back,
+    then cites it — and an evaluator that trusts its own agent's tool arguments
+    passes exactly the case it exists to catch.
+    """
+    assert _ref_case(
+        reply="Your booking QX7ZKP is confirmed for travel on 3 October.",
+        message="What's the status of my flight next week?",
+        lookups=[("QX7ZKP", {"error": "No booking found for reference QX7ZKP"})],
+    ) == 0.0
+
+
+def test_echoing_a_reference_the_user_supplied_is_not_a_fabrication() -> None:
+    """The case a naive "tool outputs only" fix would have broken.
+
+    "I couldn't find ZZZ999" is correct behaviour, and the reference is
+    legitimate because the user is the one who supplied it.
+    """
+    assert _ref_case(
+        reply="I couldn't find a booking under ZZZ999. Could you double-check it?",
+        message="Can you check booking ZZZ999?",
+        lookups=[("ZZZ999", {"error": "No booking found for reference ZZZ999"})],
+    ) == 1.0
+
+
+def test_a_reference_returned_by_the_tool_is_grounded() -> None:
+    assert _ref_case(
+        reply="Booking PLM4TQ is confirmed, New York to Miami.",
+        message="What's the status of booking PLM4TQ?",
+        lookups=[("PLM4TQ", {"reference": "PLM4TQ", "status": "Confirmed"})],
+    ) == 1.0
+
+
+def test_an_all_alphabetic_reference_is_still_checked() -> None:
+    """A digit-only test never sees this class of fabrication at all."""
+    assert _ref_case(
+        reply="I've pulled up booking PLMTQX for you.",
+        message="What's on my reservation?",
+        lookups=[("PLMTQX", {"error": "No booking found"})],
+    ) == 0.0
+
+
+def test_ordinary_uppercase_words_are_not_read_as_references() -> None:
+    """This invariant pages. A bolded REFUND must not wake anyone."""
+    assert _ref_case(
+        reply="Booking PLM4TQ is CANCELLED and no REFUND applies. STATUS: closed.",
+        message="What's the status of PLM4TQ?",
+        lookups=[("PLM4TQ", {"reference": "PLM4TQ", "status": "Cancelled"})],
+    ) == 1.0
+
+
+def test_a_broken_optional_module_is_not_read_as_an_absent_one() -> None:
+    """`except ModuleNotFoundError` also catches failures *inside* the module.
+
+    A judges.py whose own import is broken would yield judges=None and an
+    unregistered evaluator set — a green run that scored nothing, which is what
+    this loader exists to prevent.
+    """
+    import sys as _sys
+
+    from evals.core import agents as agent_modules
+
+    real_import = agent_modules.importlib.import_module
+
+    def broken(name, *a, **kw):
+        if name.endswith(".judges"):
+            raise ModuleNotFoundError("No module named 'some_missing_dep'",
+                                      name="some_missing_dep")
+        return real_import(name, *a, **kw)
+
+    agent_modules.importlib.import_module = broken
+    try:
+        with pytest.raises(ModuleNotFoundError, match="some_missing_dep"):
+            agent_modules.load("travel")
+    finally:
+        agent_modules.importlib.import_module = real_import
+        _sys.modules.pop("evals.agents.travel.judges", None)
+
+
+def test_a_zero_length_cost_window_is_honoured_not_replaced() -> None:
+    """`since_minutes or default` silently ignores an explicit 0."""
+    from evals.core import cost
+
+    captured = {}
+
+    def fake_fetch(*, since_minutes, endpoint=None):
+        captured["window"] = since_minutes
+        return {}
+
+    real = cost.fetch_projects
+    cost.fetch_projects = fake_fetch
+    try:
+        cost.report(config(monitoring={"window_minutes": 180}), since_minutes=0)
+    finally:
+        cost.fetch_projects = real
+    assert captured["window"] == 0

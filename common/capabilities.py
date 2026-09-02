@@ -114,14 +114,16 @@ DISCLOSURE = (
 BOOKABLE_TOOLS = frozenset({"search_flights", "search_hotels"})
 
 
-def presents_bookable_options(tool_calls: list[dict] | None) -> bool:
+def presents_bookable_options(tool_calls: list[dict] | None,
+                              bookable_tools: frozenset[str] | None = None) -> bool:
     """True when this turn put flights or hotels in front of the user.
 
     Empty results don't count: "there are no flights that day" cannot be
     mistaken for a held seat.
     """
+    tools = BOOKABLE_TOOLS if bookable_tools is None else bookable_tools
     for call in tool_calls or []:
-        if call.get("name") not in BOOKABLE_TOOLS:
+        if call.get("name") not in tools:
             continue
         result = call.get("output")
         if isinstance(result, list) and result:
@@ -139,6 +141,7 @@ def disclosure_due(
     message: str,
     tool_calls: list[dict] | None,
     already_disclosed: bool,
+    bookable_tools: frozenset[str] | None = None,
 ) -> bool:
     """Whether this turn owes the user the disclosure.
 
@@ -150,7 +153,8 @@ def disclosure_due(
     """
     if already_disclosed:
         return False
-    return presents_bookable_options(tool_calls) or bool(TRANSACT.search(message or ""))
+    return (presents_bookable_options(tool_calls, bookable_tools)
+            or bool(TRANSACT.search(message or "")))
 
 
 def ensure_disclosure(
@@ -159,11 +163,24 @@ def ensure_disclosure(
     *,
     tool_calls: list[dict] | None = None,
     already_disclosed: bool = False,
+    disclosure: str | None = None,
+    bookable_tools: frozenset[str] | None = None,
 ) -> str:
-    """Return `reply`, prefixed with the disclosure if this turn owes one."""
+    """Return `reply`, prefixed with the disclosure if this turn owes one.
+
+    `disclosure` and `bookable_tools` are per-tenant. The rule — disclose once,
+    the first time someone is shown something they might think is reserved — is
+    the same for every agent; the sentence and the list of tools that create
+    that impression are not. Agent two showed why: it inherited the travel
+    agent's wording ("I can only look things up and show you what's available")
+    on a booking-support turn, which is true but was written for a different
+    product.
+    """
     if discloses(reply):
         return reply
     if not disclosure_due(message=message, tool_calls=tool_calls,
-                          already_disclosed=already_disclosed):
+                          already_disclosed=already_disclosed,
+                          bookable_tools=bookable_tools):
         return reply
-    return f"{DISCLOSURE}\n\n{reply}" if reply else DISCLOSURE
+    text = disclosure or DISCLOSURE
+    return f"{text}\n\n{reply}" if reply else text

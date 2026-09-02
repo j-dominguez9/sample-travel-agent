@@ -48,10 +48,9 @@ def build(conf) -> object:
             The only task that calls a model. Its durable output is the
             annotations, not the return value.
             """
-            from evals.agents.travel import (  # noqa: F401  (registers)
-                evaluators,
-                judges,
-            )
+            from evals.core import agents as agent_modules
+
+            agent_modules.load(conf.agent)  # registers this agent's evaluators
             from evals.core import monitor, tracing
 
             # Trace the judges' own model calls so their cost is measurable.
@@ -75,8 +74,10 @@ def build(conf) -> object:
         @task
         def check_thresholds(swept: dict) -> dict:
             """Compare rates against config. Reads annotations back, never rescores."""
-            from evals.agents.travel import evaluators, judges  # noqa: F401
+            from evals.core import agents as agent_modules
             from evals.core import monitor, thresholds
+
+            agent_modules.load(conf.agent)
 
             scores = monitor.read_annotations(
                 project=conf.project,
@@ -104,9 +105,11 @@ def build(conf) -> object:
             """
             from datetime import UTC, datetime, timedelta
 
-            from evals.agents.travel import evaluators, judges  # noqa: F401
+            from evals.core import agents as agent_modules
             from evals.core import diagnose as dx
             from evals.core import monitor
+
+            agent_modules.load(conf.agent)
 
             window = int(conf.monitoring.get("window_minutes", 60))
             limit = int(conf.monitoring.get("limit", 200))
@@ -159,8 +162,10 @@ def build(conf) -> object:
             """
             from datetime import UTC, datetime, timedelta
 
-            from evals.agents.travel import evaluators, judges, truth  # noqa: F401
+            from evals.core import agents as agent_modules
             from evals.core import curate, monitor
+
+            modules = agent_modules.load(conf.agent)
 
             if not conf.curation.get("enabled", False):
                 return {"candidates": 0, "skipped": "curation disabled in config"}
@@ -179,7 +184,7 @@ def build(conf) -> object:
                 since_minutes=int(conf.monitoring.get("window_minutes", 60)),
                 limit=int(conf.monitoring.get("limit", 200)),
             )
-            candidates = curate.collect(records, scores, conf, truth)
+            candidates = curate.collect(records, scores, conf, modules.truth)
             print(curate.summary(candidates))
             dataset_id = curate.publish(candidates, conf)
             return {

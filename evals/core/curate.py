@@ -43,7 +43,7 @@ class Candidate:
     reason: str
 
 
-def _is_iso_date(value: object) -> bool:
+def is_iso_date(value: object) -> bool:
     try:
         date.fromisoformat(str(value).strip())
     except (TypeError, ValueError):
@@ -86,55 +86,33 @@ def derive_expected(record: dict, truth_module: Any) -> tuple[dict[str, Any], bo
     """Compute what the tools should have returned, where the fixtures can say.
 
     Returns (expected, needs_review, reason).
+
+    The framework decides only the two agent-independent cases: a turn with no
+    tool call has no computable expectation, and a turn whose tool call was
+    correct has a reply-level failure that a human must judge. Everything
+    between those is domain truth, so an agent supplies it by exposing
+    `derive_expected(record)` on its truth module — returning None when it
+    cannot derive this particular call.
+
+    This used to branch on `search_flights` and `search_hotels` directly, which
+    meant onboarding a second agent silently sent every one of its candidates
+    to manual review while looking like it worked.
     """
     calls = (record.get("output") or {}).get("tool_calls") or []
     if not calls:
         return ({}, True, "no tool call — expected behaviour needs a human")
 
+    hook = getattr(truth_module, "derive_expected", None)
+    if hook is not None:
+        derived = hook(record)
+        if derived is not None:
+            return derived
+
     call = calls[0]
-    args = call.get("input") or {}
-    name = call.get("name")
-
-    if name == "search_flights" and {"origin", "destination", "date"} <= set(args):
-        # `expected_flights` compares ISO strings lexicographically and never
-        # raises, so a malformed date silently matches nothing. Deriving from
-        # that would publish "there are no flights on this route" as ground
-        # truth when the real defect was the date the agent sent.
-        if not _is_iso_date(args["date"]):
-            return ({}, True, f"agent sent a malformed date ({args['date']!r})")
-        flights = truth_module.expected_flights(
-            args["origin"], args["destination"], args["date"]
-        )
-        return (
-            {
-                "expected_tool": name,
-                "expected_args": args,
-                "expected_result_ids": sorted(f["flight_number"] for f in flights),
-                "expected_behavior": "answer" if flights else "empty",
-            },
-            False,
-            "derived from fixtures",
-        )
-
-    if name == "search_hotels" and {"city", "check_in"} <= set(args):
-        if not _is_iso_date(args["check_in"]):
-            return ({}, True, f"agent sent a malformed date ({args['check_in']!r})")
-        hotels = truth_module.expected_hotels(args["city"], args["check_in"])
-        return (
-            {
-                "expected_tool": name,
-                "expected_args": args,
-                "expected_result_ids": sorted(h["name"] for h in hotels),
-                "expected_behavior": "answer" if hotels else "empty",
-            },
-            False,
-            "derived from fixtures",
-        )
-
     # Reply-level failures (an unsourced claim over correct tool output) have no
     # computable expected value. The tool call was right; the prose was not.
     return (
-        {"expected_tool": name, "expected_args": args},
+        {"expected_tool": call.get("name"), "expected_args": call.get("input") or {}},
         True,
         "tool call correct — the failure is in the reply, so a human decides",
     )

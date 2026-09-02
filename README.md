@@ -21,6 +21,9 @@ agent/
 backend/
 ├── main.py     # FastAPI app
 └── tracing.py  # Phoenix / OpenTelemetry setup
+support/            # agent two — post-booking support, same framework
+├── prompt.py   # its own prompt, disclosure wording and bookable tools
+└── tools.py    # lookup_booking, cancellation_policy
 common/
 ├── logging.py       # JSON-lines logging
 ├── redaction.py     # strips PII from spans at export
@@ -186,6 +189,30 @@ Point it at a different host with an argument or env var:
 uv run python scripts/generate_traffic.py http://localhost:9000
 # or
 TRAVEL_AGENT_URL=http://localhost:9000 uv run python scripts/generate_traffic.py
+```
+
+## Multiple agents
+
+The framework is multi-tenant. Adding an agent is a directory under
+`evals/agents/<name>/` and a `config.yaml`; the DAGs glob for those, so both a
+monitoring DAG and a regression DAG appear without touching `dags/`.
+
+The split is: **prompt, tools and domain evaluators are per tenant; the
+mechanisms are shared.** Sweeping, thresholds, curation, diagnosis, cost, the
+registry and the DAGs are agent-agnostic, and so are the three evaluators that
+do not depend on a domain — PII, hallucination and tool-response handling —
+which live in `evals/core/library.py` and are registered per agent with that
+agent's own adapters.
+
+A second agent (`support`) exists because the claim needed testing. It found
+three places where travel-agent code was living in the framework: the triage
+prompt hardcoded the travel tools, `derive_expected` branched on
+`search_flights`, and the DAG tasks imported `evals.agents.travel` by name —
+which would have made the support DAG score zero turns and report success. All
+three are fixed, and `tests/test_evals_framework.py` pins them.
+
+```bash
+uv run python scripts/generate_support_traffic.py
 ```
 
 ## Notes
