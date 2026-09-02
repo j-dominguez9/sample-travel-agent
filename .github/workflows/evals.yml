@@ -1,18 +1,22 @@
 name: evals
 
-# Three tiers, split by what each costs and how deterministic it is.
+# Two tiers here, split by what each costs and how deterministic it is.
 #
-#   fast     lint, types, hermetic tool tests. No model, no secrets, no network.
-#            Runs on everything, including fork PRs. ~seconds.
-#   agent    the agent integration suite. Calls the model, so it needs a key and
-#            only runs where secrets are available. ~20s, well under a dollar.
-#   nightly  the full 199-example experiment with LLM judges and repetitions.
-#            Non-deterministic and comparatively expensive — never a PR gate.
+#   fast   lint, types, hermetic tests. No model, no secrets, no network.
+#          Runs on everything, including fork PRs. ~seconds.
+#   agent  the agent integration suite. Calls the model, so it needs a key and
+#          only runs where secrets are available. ~20s, well under a dollar.
 #
-# Judges never block a merge. Their output varies run to run: an earlier signal
-# here moved ~7 points on a single run and turned out to be sampling noise, so a
-# judge in a blocking gate would flake builds. They gate on the nightly
-# aggregate instead.
+# The third tier — the full 199-example experiment with judges and repetitions —
+# runs in Airflow as `agent_regression_travel`, not here. It has to reach Phoenix
+# to record results and diff them against the previous night, and a GitHub runner
+# cannot reach a self-hosted Phoenix. The DAG also does the comparison and the
+# drift alerting that a bare workflow run does not.
+#
+# Judges never block a merge. Their output varies run to run: a signal here once
+# moved ~7 points on a single run and turned out to be sampling noise, so a judge
+# in a blocking gate would flake builds. They gate on the nightly aggregate,
+# in the DAG.
 
 on:
   # `push` is limited to main so a PR branch does not run everything twice —
@@ -20,8 +24,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    - cron: "0 6 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -107,28 +109,3 @@ jobs:
           # platform's uptime.
           PHOENIX_TEST_TRACKING: ${{ secrets.PHOENIX_ENDPOINT != '' }}
         run: uv run pytest tests/evals -q -n auto
-
-  nightly:
-    name: full experiment
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      - run: uv sync --all-extras --dev
-
-      - name: full golden-set experiment with judges
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          PHOENIX_COLLECTOR_ENDPOINT: ${{ secrets.PHOENIX_ENDPOINT }}
-          # Without this the nightly tier silently fails to record against an
-          # authenticated Phoenix — and the nightly tier is the one that gates
-          # on judge aggregates.
-          PHOENIX_API_KEY: ${{ secrets.PHOENIX_API_KEY }}
-        run: |
-          uv run python -m evals.run_experiment \
-            --name "nightly-${{ github.run_number }}" \
-            --evaluators hallucination,recommendation_grounded,no_fabricated_flights,flight_direction \
-            --repetitions 3

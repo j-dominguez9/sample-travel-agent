@@ -36,7 +36,22 @@ def main() -> None:
 
     from dotenv import load_dotenv
     load_dotenv(HERE / ".env")
-    os.environ.setdefault("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
+    # An *absent* variable means local development, where localhost is the right
+    # default. A variable that is present but empty means something set it and
+    # had nothing to set it to — an unconfigured CI secret. `setdefault` does not
+    # replace an empty string, so the old default let that through, Phoenix fell
+    # back to its own localhost:4317, and the run died 199 examples later in an
+    # httpx stack trace instead of on the line that was actually wrong.
+    endpoint = os.environ.get("PHOENIX_COLLECTOR_ENDPOINT")
+    if endpoint is None:
+        os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = "http://localhost:6006"
+    elif not endpoint.strip():
+        raise SystemExit(
+            "PHOENIX_COLLECTOR_ENDPOINT is set but empty.\n"
+            "In CI that means the PHOENIX_ENDPOINT secret is not configured.\n"
+            "This experiment writes its results to Phoenix and compares them "
+            "against the previous run, so it cannot run without one."
+        )
     # Must be set before `agent.prompt` is imported — it resolves at import time.
     if args.prompt_version:
         os.environ["PROMPT_VERSION"] = args.prompt_version
