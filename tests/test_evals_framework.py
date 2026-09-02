@@ -15,6 +15,9 @@ synthetic DataFrames in exactly the shape `monitor.score` and
 
 from __future__ import annotations
 
+import random
+from types import SimpleNamespace
+
 import pandas as pd
 import pytest
 
@@ -25,7 +28,7 @@ import pytest
 from evals.agents.travel import evaluators, judges  # noqa: F401
 from evals.agents.travel import truth as T
 from evals.core import config as agent_config
-from evals.core import curate, diagnose, thresholds
+from evals.core import curate, diagnose, monitor, thresholds
 from evals.core.config import AgentConfig
 from evals.core.registry import REGISTRY, Registry
 
@@ -41,10 +44,11 @@ def scores(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
     )
 
 
-def turn(span_id: str, message: str, calls: list[dict] | None = None, reply: str = "ok") -> dict:
+def turn(span_id: str, message: str, calls: list[dict] | None = None, reply: str = "ok",
+         turn_index: int | None = None) -> dict:
     return {
         "span_id": span_id,
-        "input": {"message": message},
+        "input": {"message": message, "turn_index": turn_index},
         "output": {"reply": reply, "tool_calls": calls or []},
     }
 
@@ -117,7 +121,83 @@ def test_config_defaults_when_sections_are_absent() -> None:
     c = AgentConfig(agent="a", project="p", dataset="d", agent_span_name="s")
     assert c.schedule == "@hourly"
     assert c.min_sample == 20
+    assert c.judge_max_turns is None  # uncapped unless a config asks for it
     assert c.thresholds == {}
+
+
+# --------------------------------------------------------------------------
+# judge sampling — the cost ceiling must never weaken an invariant
+#
+# These use a stub registry rather than the travel one. The behaviour under
+# test is which records reach which evaluator, and running it against the real
+# judges would bill four model calls per turn to assert a routing decision.
+# --------------------------------------------------------------------------
+
+class _Stub:
+    """Minimal evaluator: records what it was given, returns a fixed result."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def evaluate(self, row: dict) -> list[SimpleNamespace]:
+        self.seen.append(row["input"]["span_id"])
+        return [SimpleNamespace(score=1.0, label="pass", explanation="stub")]
+
+
+def _sampling_fixture() -> tuple[Registry, dict[str, _Stub]]:
+    reg = Registry()
+    stubs = {
+        "code_a": _Stub(), "code_b": _Stub(),
+        "judge_a": _Stub(), "judge_b": _Stub(),
+    }
+    for name, stub in stubs.items():
+        reg.register(agent="t", name=name, mode="invariant", online=True,
+                     kind="code" if name.startswith("code") else "llm")(stub)
+    return reg, stubs
+
+
+def _turns(n: int) -> list[dict]:
+    return [{"span_id": f"s{i}", "input": {"span_id": f"s{i}"}, "output": {}}
+            for i in range(n)]
+
+
+def test_judge_cap_never_thins_the_code_evaluators() -> None:
+    """Sampling is a cost control on the judges, not a coverage decision.
+
+    `no_unredacted_pii` scored on a sample is not a privacy control — a leak in
+    an unsampled turn is still a leak. So the cap applies to LLM evaluators
+    only, and every code evaluator still sees every turn.
+    """
+    reg, stubs = _sampling_fixture()
+    monitor.score(_turns(40), "t", judge_max_turns=5,
+                  rng=random.Random(0), registry=reg)
+    assert len(stubs["code_a"].seen) == 40
+    assert len(stubs["code_b"].seen) == 40
+
+
+def test_judge_cap_is_a_ceiling_not_a_rate() -> None:
+    """Below the cap nothing is sampled, so thin traffic never gets thinner.
+
+    This is what keeps the cap from feeding the `min_sample` floor: a sweep of
+    30 turns hands all 30 to the judges, not a fraction of them.
+    """
+    reg, stubs = _sampling_fixture()
+    monitor.score(_turns(30), "t", judge_max_turns=150,
+                  rng=random.Random(0), registry=reg)
+    assert len(stubs["judge_a"].seen) == 30
+
+
+def test_judge_cap_draws_one_sample_shared_by_every_judge() -> None:
+    """Above the ceiling the judges see exactly the cap — and the same turns.
+
+    Sampling per judge would have each grading a different window, so their
+    rates could not be compared to each other or to a previous sweep.
+    """
+    reg, stubs = _sampling_fixture()
+    monitor.score(_turns(40), "t", judge_max_turns=5,
+                  rng=random.Random(0), registry=reg)
+    assert len(stubs["judge_a"].seen) == 5
+    assert set(stubs["judge_a"].seen) == set(stubs["judge_b"].seen)
 
 
 # --------------------------------------------------------------------------
@@ -447,6 +527,40 @@ def test_a_past_date_is_still_searched() -> None:
                                               "input": {"date": "2027-03-12"}, "output": []}]}}
     assert ev.evaluate(substituted)[0].score == 0.0, "silently searching a different date is a refusal"
 
+    # Not every tool accepts a date. create_itinerary takes destination and
+    # num_days, so a past date can never reach an argument even when the agent
+    # fulfils the request correctly — this was a live false positive on real
+    # traffic before the check learned the difference.
+    undated_tool = {"input": {"message": "A 5-day itinerary for Paris, arriving June 10, 2026."},
+                    "output": {"reply": "Here is your itinerary.",
+                               "tool_calls": [{"name": "create_itinerary",
+                                               "input": {"destination": "Paris", "num_days": 5},
+                                               "output": {}}]}}
+    # Scored None, not 1.0. The request was plausibly honoured, but nothing in
+    # the turn proves it, and counting an unverifiable turn as a pass inflates
+    # the metric that gates on it. `sweep()` drops null scores, so this leaves
+    # the denominator rather than padding it.
+    result = ev.evaluate(undated_tool)[0]
+    assert result.score is None
+    assert result.label == "unverifiable"
+
+
+def test_unverifiable_turns_leave_the_denominator() -> None:
+    """A null score must not be logged as a pass or a failure.
+
+    This is the property the None relies on: `sweep` drops null-scored rows
+    before writing annotations, so an unverifiable turn is absent from the rate
+    rather than counted in it.
+    """
+    scored = pd.DataFrame([
+        {"span_id": "a", "annotation_name": "past_date_still_searched", "score": 1.0},
+        {"span_id": "b", "annotation_name": "past_date_still_searched", "score": None},
+        {"span_id": "c", "annotation_name": "past_date_still_searched", "score": 0.0},
+    ])
+    kept = scored.dropna(subset=["score"])
+    assert len(kept) == 2
+    assert kept["score"].mean() == 0.5, "the null turn must not shift the rate"
+
 
 def test_a_stated_total_must_match_the_arithmetic() -> None:
     """Derived values were the largest taxonomy category. Sound arithmetic is
@@ -488,3 +602,154 @@ def test_totals_pair_rates_with_their_own_stay_length() -> None:
     assert score("$385/night — $1,540 for 4 nights.", malformed) == 1.0
 
     assert score("$385/night — $1,155 for 4 nights.", [hotels("2026-06-10", "2026-06-14", 385)]) == 0.0
+
+
+# --------------------------------------------------------------------------
+# session identity — what the judges' applicability gate depends on
+# --------------------------------------------------------------------------
+
+def test_every_tool_call_reaches_the_judge_not_just_the_first() -> None:
+    """A multi-tool turn must show the judge all of its evidence.
+
+    Passing only call #1 made facts sourced from calls #2..n look invented:
+    four `get_weather` calls, one per night, read as three fabricated days.
+    """
+    calls = [
+        {"name": "get_weather", "input": {"date": "2026-05-01"},
+         "output": {"condition": "Sunny"}},
+        {"name": "get_weather", "input": {"date": "2026-05-02"},
+         "output": {"condition": "Humid"}},
+    ]
+    rendered = judges._all_calls(turn("s1", "weather?", calls), "output")
+    assert "Sunny" in rendered
+    assert "Humid" in rendered, "evidence from the second call was dropped"
+    assert "get_weather" in rendered, "the judge cannot tell which result is which"
+
+
+def test_a_single_call_is_still_rendered_unwrapped() -> None:
+    """The common case keeps its original shape — the judge was validated on it."""
+    calls = [{"name": "search_flights", "input": {}, "output": {"airline": "Delta"}}]
+    assert judges._all_calls(turn("s1", "flights?", calls), "output") == '{"airline": "Delta"}'
+
+
+def test_graceful_alternative_skips_a_follow_up_answered_from_context() -> None:
+    """"Which of those is cheapest?" calls no tool, but nothing was unavailable.
+
+    Grading it asks the judge how well the agent handled having nothing to
+    offer, when it had plenty — and the judge duly says so, which lands as a
+    failure. This is what dragged the metric from 84.6% to 73.8%.
+    """
+    assert not judges._no_results(
+        turn("s1", "Which of those is cheapest?", calls=[], turn_index=2)
+    )
+
+
+def test_graceful_alternative_still_covers_an_opening_out_of_scope_request() -> None:
+    """The case the evaluator exists for must survive the tightening."""
+    assert judges._no_results(
+        turn("s1", "Do I need a visa to visit Japan?", calls=[], turn_index=1)
+    )
+
+
+def test_graceful_alternative_covers_empty_results_at_any_turn() -> None:
+    """A search that found nothing is a no-results turn wherever it happens."""
+    empty = [{"name": "search_flights", "input": {}, "output": []}]
+    assert judges._no_results(turn("s1", "flights to Lagos?", empty, turn_index=4))
+
+
+def test_spans_without_a_turn_index_keep_the_old_behaviour() -> None:
+    """Spans predating session identity must not vanish from the denominator."""
+    assert judges._no_results(turn("s1", "anything?", calls=[], turn_index=None))
+
+
+def test_turn_index_is_read_from_the_nested_attribute_shape() -> None:
+    """Phoenix nests dotted attribute namespaces; session.id stays flat.
+
+    Reading only the flat column returned None for every span, which silently
+    disabled the follow-up gate rather than failing — the exact shape of bug
+    that reaches production looking like "the fix didn't work".
+    """
+    spans = pd.DataFrame([
+        {"name": "travel_agent", "context.span_id": "s1", "context.trace_id": "t1",
+         "parent_id": None, "span_kind": "AGENT",
+         "attributes.input.value": "Which of those is cheapest?",
+         "attributes.output.value": "The Delta one, $214.",
+         "attributes.session.id": "conv-1",
+         "attributes.travel_agent": {"turn_index": 2}},
+    ])
+    rec = monitor.reconstruct(spans)[0]
+    assert rec["session_id"] == "conv-1"
+    assert rec["input"]["turn_index"] == 2
+    assert not judges._no_results(rec)
+
+
+# --------------------------------------------------------------------------
+# capability disclosure
+# --------------------------------------------------------------------------
+
+def _booking(reply: str, message: str = "Hold the New York to Chicago flight "
+                                        "on October 8, 2026 — put the deposit on my card.") -> float:
+    from evals.agents.travel.evaluators import booking_limits_disclosed
+    return booking_limits_disclosed.evaluate(
+        {"input": {"message": message}, "output": {"reply": reply, "tool_calls": []}}
+    )[0].score
+
+
+def test_listing_flights_without_saying_it_cannot_book_fails() -> None:
+    """The production failure: search results, limitation left unsaid."""
+    assert _booking(
+        "Here are your options on October 8, 2026: United UA 512 departs 6:50am — $178."
+    ) == 0.0
+
+
+def test_a_plain_disclosure_passes() -> None:
+    assert _booking(
+        "I can't hold a flight or take a deposit — I can only search. "
+        "Here's what's available on October 8: United UA 512 at $178."
+    ) == 1.0
+
+
+def test_implying_the_booking_happened_fails_even_with_a_disclosure() -> None:
+    """Worse than silence: the user acts on a seat that was never held."""
+    assert _booking(
+        "I can't process payments directly, but you're all set on United UA 512."
+    ) == 0.0
+
+
+def test_non_transactional_requests_are_not_graded() -> None:
+    assert _booking("Here are the flights I found.",
+                    message="What flights are there from Denver to Chicago?") == 1.0
+
+
+def test_disclosure_is_not_matched_by_the_prompt_s_own_wording() -> None:
+    """Guard against a tautological evaluator.
+
+    If this only recognised the phrasing v5 asks for, it would prove the prompt
+    was pasted rather than that the agent disclosed anything. Wordings the
+    prompt never mentions must still pass.
+    """
+    for reply in (
+        "Unfortunately I'm unable to book that for you, but here's what's free.",
+        "I have no way to reserve seats — you'd need to book directly.",
+        "I am not able to complete a purchase, though I can show you the options.",
+    ):
+        assert _booking(reply) == 1.0, reply
+
+
+def test_real_disclosure_wordings_from_production_are_recognised() -> None:
+    """Pinned from the v4 baseline, where both scored as silence.
+
+    `\\bbook\\b` misses "bookings" and `\\breserve\\b` misses "reservations".
+    A paging invariant that fires on correct behaviour gets muted, so its
+    false-negative rate matters as much as its false-positive rate.
+    """
+    assert _booking(
+        "I can't help with changes to existing reservations. What I can help "
+        "with is booking flights, finding hotels, and checking weather.",
+        message="Can you change the name on my existing reservation?",
+    ) == 1.0
+    assert _booking(
+        "I can't help with refunds or manage bookings you've already made — "
+        "that's something you'd need to take up with the airline.",
+        message="I booked a flight through you last month and need a refund.",
+    ) == 1.0

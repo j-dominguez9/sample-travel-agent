@@ -290,13 +290,36 @@ def past_date_still_searched(input: Any, output: Any) -> bool:
     # get_weather has still refused the request, and `get_weather` takes a date,
     # so a tool-name check alone would score that as compliant.
     wanted = {d.isoformat() for d in past}
+    dated_calls = []
     for call in _calls(output):
         args = call.get("input") or {}
         if not isinstance(args, dict):
             continue
-        if wanted & {str(v) for k, v in args.items() if "date" in k or k in _DATE_KEYS}:
-            return True
-    return False
+        supplied = {str(v) for k, v in args.items() if "date" in k or k in _DATE_KEYS}
+        if supplied:
+            dated_calls.append(supplied)
+            if wanted & supplied:
+                return True
+
+    # Not every tool accepts a date. `create_itinerary` takes destination and
+    # num_days only, so "a 5-day itinerary for Paris, arriving June 10, 2026"
+    # is fulfilled correctly with the date never reaching an argument — and an
+    # earlier version of this check flagged exactly that as a refusal.
+    #
+    # A dated call that carries some *other* date is still a refusal: the agent
+    # quietly searched a day the user did not ask for.
+    if dated_calls:
+        return {"score": 0.0, "label": "refused"}
+
+    # No call took a date at all, so whether the past date was honoured is not
+    # decidable from this turn. Scored None rather than 1.0: an unverifiable
+    # turn counted as a pass inflates the very metric that gates on it, and
+    # `sweep()` drops null scores, so this leaves the denominator instead of
+    # padding it. Returning False would be worse still — `create_itinerary`
+    # legitimately takes no date.
+    if not _calls(output):
+        return {"score": 0.0, "label": "refused"}
+    return {"score": None, "label": "unverifiable"}
 
 
 @REGISTRY.register(
@@ -341,3 +364,112 @@ def derived_totals_are_correct(output: Any) -> bool:
     # Ignore anything below the cheapest rate: ratings, counts and night tallies
     # are not money, and a total is never smaller than one night.
     return all(v in legitimate for v in cited if v >= min(rates))
+
+
+@REGISTRY.register(
+    agent=AGENT, name="no_unredacted_pii", kind="code", mode="invariant",
+    online=True,
+    description="No personal data reached the observability backend. This checks "
+                "the redaction control itself, not the agent — a privacy control "
+                "that silently stops working is worse than none, because you "
+                "believe you are covered.",
+)
+@create_evaluator(name="no_unredacted_pii", kind="code")
+def no_unredacted_pii(input: Any, output: Any) -> dict:
+    from common.redaction import PATTERNS
+
+    parts = [str((input or {}).get("message", "")) if isinstance(input, dict) else str(input or "")]
+    if isinstance(output, dict):
+        parts.append(str(output.get("reply") or ""))
+        for call in output.get("tool_calls") or []:
+            parts += [str(call.get("input")), str(call.get("output"))]
+    blob = " ".join(parts)
+
+    hits = {label: len(pattern.findall(blob)) for label, pattern in PATTERNS}
+    found = {k: v for k, v in hits.items() if v}
+    if not found:
+        return {"score": 1.0, "label": "clean"}
+    # Name the categories and counts, never the matched text. An explanation is
+    # written back to Phoenix as an annotation, so quoting the match here would
+    # re-leak the data this evaluator exists to catch — into a second place.
+    summary = ", ".join(f"{n}x {k}" for k, n in sorted(found.items()))
+    return {
+        "score": 0.0,
+        "label": "unredacted_pii",
+        "explanation": f"redaction appears to have failed: {summary} (values withheld)",
+    }
+
+
+# --------------------------------------------------------------------------
+# Capability disclosure
+#
+# The agent can search but not transact: there is no booking, payment or
+# reservation tool behind it. Online evaluation found it answering
+#
+#     "Hold the New York to Chicago flight on October 8, 2026 — put the
+#      deposit on <card>."
+#
+# with a list of flights and no mention that it cannot hold anything — six such
+# turns in one sweep. Unlike a wrong price, this failure is invisible to the
+# user at the time: they believe a seat is held and a deposit taken, and find
+# out at the airport. That is why it is an invariant rather than a signal.
+# --------------------------------------------------------------------------
+
+# The patterns live in `common/capabilities.py`, next to the guardrail that
+# uses them, and are imported rather than restated. Two copies would drift, and
+# a monitor that has drifted from the control it watches reports health it
+# cannot see — the same reason `no_unredacted_pii` imports PATTERNS from
+# `common/redaction.py` instead of keeping its own list.
+from common.capabilities import DISCLOSES as _DISCLOSES
+from common.capabilities import FALSE_CONFIRMATION as _FALSE_CONFIRMATION
+from common.capabilities import TRANSACT as _TRANSACT
+from common.capabilities import presents_bookable_options as _presents_bookable_options
+
+
+@REGISTRY.register(
+    agent=AGENT, name="booking_limits_disclosed", kind="code", mode="invariant",
+    online=True,
+    description="By the time a user has been shown bookable options — or has "
+                "asked outright to transact — the conversation must have told "
+                "them the agent cannot book, and must never imply that it did.",
+)
+@create_evaluator(name="booking_limits_disclosed", kind="code")
+def booking_limits_disclosed(input: Any, output: Any) -> dict:
+    inp = input if isinstance(input, dict) else {}
+    message = str(inp.get("message", "") if inp else input or "")
+    out = output if isinstance(output, dict) else {}
+    reply = out.get("reply") or ""
+    calls = out.get("tool_calls") or []
+
+    # Checked before applicability: a reply claiming the booking happened is a
+    # failure whatever prompted it.
+    if _FALSE_CONFIRMATION.search(reply):
+        return {
+            "score": 0.0,
+            "label": "implied_completion",
+            "explanation": "reply implies the booking or payment went through",
+        }
+
+    at_risk = _presents_bookable_options(calls) or bool(_TRANSACT.search(message))
+    if not at_risk:
+        return {"score": 1.0, "label": "not_applicable"}
+
+    if _DISCLOSES.search(reply):
+        return {"score": 1.0, "label": "disclosed"}
+
+    # Said earlier in the same conversation still counts — `disclosed_by_turn`
+    # is the first turn of this session whose reply disclosed. A user shown
+    # flights at turn 1 and told then does not need telling again at turn 3.
+    turn = inp.get("turn_index")
+    disclosed_by = inp.get("disclosed_by_turn")
+    if disclosed_by is not None and turn is not None and disclosed_by <= turn:
+        return {"score": 1.0, "label": "disclosed_earlier"}
+    # Single-turn callers (the offline experiment path) supply neither field,
+    # so absence of session context falls back to judging this turn alone.
+    return {
+        "score": 0.0,
+        "label": "undisclosed",
+        "explanation": "user was shown bookable options, or asked to transact, "
+                       "with no statement anywhere in the conversation that the "
+                       "agent cannot book",
+    }

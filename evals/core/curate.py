@@ -28,6 +28,7 @@ from typing import Any
 
 import pandas as pd
 
+from common.redaction import redact_text
 from evals.core.config import AgentConfig
 from evals.core.registry import REGISTRY
 
@@ -186,7 +187,11 @@ def publish(candidates: list[Candidate], config: AgentConfig, client: Any = None
             {
                 # Stable on the span, so a re-run updates rather than duplicates.
                 "id": f"cand-{c.span_id}",
-                "input": {"message": c.message},
+                # Defence in depth: if redaction upstream ever fails, curation
+                # would otherwise copy personal data out of a trace and into a
+                # dataset — a second store, with a different lifecycle, that
+                # nobody thinks of as observability.
+                "input": {"message": redact_text(c.message)},
                 "output": c.expected,
                 "metadata": {
                     "source": "production",

@@ -9,6 +9,7 @@ from opentelemetry import trace
 from agent.config import MAX_TOKENS, MODEL
 from agent.prompt import system_prompt
 from agent.tools import TOOLS, execute_tool
+from common.capabilities import discloses, ensure_disclosure
 
 client = anthropic.Anthropic()
 
@@ -73,12 +74,45 @@ def _record_output(span: Any, result: Any) -> None:
     _record(span, "set_output", result)
 
 
+def _assistant_texts(messages: list) -> Iterator[str]:
+    """Text the assistant has already said in this conversation.
+
+    Content is either a plain string (a turn this guardrail rewrote) or the
+    SDK's list of content blocks, so both shapes have to be handled.
+    """
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            yield content
+            continue
+        for block in content or []:
+            text = getattr(block, "text", None)
+            if text is None and isinstance(block, dict):
+                text = block.get("text")
+            if text:
+                yield text
+
+
 def run_agent(messages: list) -> tuple[str, list]:
     """Run one user turn through the tool-calling loop.
 
     `messages` must end with the latest user message. Returns the assistant's
     reply text and the updated message history.
     """
+    # Whether the conversation has already been told, read from history before
+    # this turn adds to it.
+    already_disclosed = any(discloses(t) for t in _assistant_texts(messages))
+    # The user's own message: the last user turn whose content is a string. The
+    # tool results appended below also carry the "user" role, with a list.
+    last_user = next(
+        (m["content"] for m in reversed(messages)
+         if m.get("role") == "user" and isinstance(m.get("content"), str)),
+        "",
+    )
+    calls: list[dict] = []
+
     while True:
         response = client.messages.create(
             model=MODEL,
@@ -98,6 +132,7 @@ def run_agent(messages: list) -> tuple[str, list]:
                 with _tool_span(block.name, block.input) as span:
                     result = execute_tool(block.name, block.input)
                     _record_output(span, result)
+                calls.append({"name": block.name, "output": result})
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -108,4 +143,18 @@ def run_agent(messages: list) -> tuple[str, list]:
         messages.append({"role": "user", "content": tool_results})
 
     reply = "".join(block.text for block in response.content if block.type == "text")
-    return reply, messages
+
+    # Guardrail, not a guideline: two prompt versions asked the model to say it
+    # cannot transact and neither beat doing nothing (see `capabilities.py`).
+    # The trigger is "has this conversation seen bookable options", not "did the
+    # user use a booking word" — the sentence that puts a user at risk is
+    # usually "I'll take it", which contains no such word.
+    disclosed = ensure_disclosure(
+        last_user, reply, tool_calls=calls, already_disclosed=already_disclosed
+    )
+    if disclosed != reply:
+        # Keep history equal to what the user actually saw. Otherwise the model
+        # never learns the disclosure was made, repeats it on the next turn, and
+        # `already_disclosed` reads False forever.
+        messages[-1] = {"role": "assistant", "content": disclosed}
+    return disclosed, messages

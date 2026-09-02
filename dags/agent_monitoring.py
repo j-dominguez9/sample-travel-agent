@@ -58,6 +58,7 @@ def build(conf) -> object:
                 since_minutes=int(conf.monitoring.get("window_minutes", 60)),
                 limit=int(conf.monitoring.get("limit", 200)),
                 agent_span_name=conf.agent_span_name,
+                judge_max_turns=conf.judge_max_turns,
             )
             return {"annotations": len(results),
                     "spans": int(results["span_id"].nunique()) if len(results) else 0}

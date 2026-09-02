@@ -36,6 +36,12 @@ class AgentConfig:
     def min_sample(self) -> int:
         return int(self.monitoring.get("min_sample", 20))
 
+    @property
+    def judge_max_turns(self) -> int | None:
+        """Ceiling on turns the LLM judges grade per sweep; None = no cap."""
+        value = self.monitoring.get("judge_max_turns")
+        return int(value) if value is not None else None
+
 
 def load(path: str | Path) -> AgentConfig:
     path = Path(path)
