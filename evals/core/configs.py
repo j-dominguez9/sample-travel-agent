@@ -84,7 +84,8 @@ if __name__ == "__main__":
     from evals.agents.travel import evaluators, judges  # noqa: F401  (registers)
 
     delete("__probe__")
-    made = sync("travel")
+    agent = sys.argv[1] if len(sys.argv) > 1 else "travel"
+    made = sync(agent)
     print(f"created {len(made)} annotation configs: {', '.join(made) or '(none new)'}")
     for name, cid in sorted(existing().items()):
         print(f"  {name:26} {cid}")

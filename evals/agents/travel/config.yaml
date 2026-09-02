@@ -1,0 +1,69 @@
+# Per-agent configuration. The DAGs expand over every file matching
+# evals/agents/*/config.yaml, so adding agent two is a new directory and this
+# file — not a change to the framework or the DAG.
+
+agent: travel
+project: travel-agent                 # Phoenix project carrying production traces
+dataset: travel-golden-v1
+agent_span_name: travel_agent
+
+monitoring:
+  schedule: "@hourly"
+  window_minutes: 60
+  limit: 200
+  # Never alert on a thin sample. An earlier sweep put graceful_alternative at
+  # n=2 and reported 50%; acting on that would be acting on one conversation.
+  min_sample: 20
+
+# Direction comes from the evaluator registry, so a threshold only has to say
+# which side of the line is bad. Rates are fractions of applicable turns.
+thresholds:
+  flight_direction:        {min_rate: 0.99}
+  no_fabricated_flights:   {min_rate: 0.99}
+  weather_values_plausible: {min_rate: 0.99}
+  no_internal_leak:        {min_rate: 0.95}
+  hallucination:           {max_rate: 0.05}   # minimize: flagged fraction
+  recommendation_grounded: {min_rate: 0.90}
+  tool_response_handling:  {min_rate: 0.85}
+  graceful_alternative:    {min_rate: 0.80}
+  # Stochastic by nature — the model choosing to call a tool. Measured at
+  # 98.8-99.2%, so this floor catches a real collapse without firing on the
+  # ordinary miss the PR gate deliberately tolerates.
+  tool_selection:          {min_rate: 0.97}
+
+alerting:
+  # Discovery call: groundedness and correctness page the Head of Product and
+  # the engineering team at low single digits.
+  owners:
+    - head-of-product
+    - agent-engineering
+  page_on:
+    - flight_direction
+    - no_fabricated_flights
+    - hallucination
+    - recommendation_grounded
+
+regression:
+  schedule: "0 3 * * *"
+  evaluators:
+    - hallucination
+    - recommendation_grounded
+    - no_fabricated_flights
+    - flight_direction
+    # The PR gate logs tool_selection but cannot assert it — whether the model
+    # chooses to call a tool is stochastic (98.8-99.2% measured over n=597), and
+    # asserting it per case reddens ~a third of CI runs. It is gated here
+    # instead, on the aggregate over 199 examples x 3 repetitions.
+    - tool_selection
+  repetitions: 3
+  # Alert if a metric moves more than this against the previous nightly run.
+  # Catches drift with no code change — a provider model update, a prompt edit
+  # merged elsewhere — which CI structurally cannot see.
+  drift_tolerance: 0.10
+
+curation:
+  # Flagged production turns become candidate golden cases. Never merged
+  # automatically: the customer requires a human in the loop for regressions.
+  enabled: true
+  candidates_dataset: travel-candidates
+  max_per_run: 25

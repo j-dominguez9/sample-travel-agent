@@ -180,6 +180,46 @@ def purge(
     return deleted
 
 
+def read_annotations(
+    *,
+    project: str,
+    agent_span_name: str = "travel_agent",
+    since_minutes: int = 60,
+    limit: int = 200,
+    client: Client | None = None,
+) -> pd.DataFrame:
+    """Re-read a sweep's scores from Phoenix, in the shape `score()` returns.
+
+    Downstream tasks need the scores but must not recompute them: the judges
+    cost real money per call. Phoenix already holds them as annotations, so it
+    is both the durable record and the hand-off between tasks — which also keeps
+    each task independently re-runnable without a large XCom payload.
+    """
+    client = client or Client()
+    start = datetime.now(UTC) - timedelta(minutes=since_minutes)
+    spans = client.spans.get_spans_dataframe(
+        project_identifier=project, start_time=start, limit=limit
+    )
+    if spans.empty:
+        return pd.DataFrame()
+    span_ids = spans[spans["name"] == agent_span_name]["context.span_id"].tolist()
+    if not span_ids:
+        return pd.DataFrame()
+
+    ann = client.spans.get_span_annotations_dataframe(
+        span_ids=span_ids, project_identifier=project
+    )
+    if ann.empty:
+        return pd.DataFrame()
+    out = ann.reset_index().rename(
+        columns={"result.score": "score", "result.label": "label",
+                 "result.explanation": "explanation"}
+    )
+    keep = [c for c in ("span_id", "annotation_name", "score", "label", "explanation")
+            if c in out.columns]
+    return out[keep]
+
+
 def sweep(
     *,
     agent: str,

@@ -1,0 +1,134 @@
+name: evals
+
+# Three tiers, split by what each costs and how deterministic it is.
+#
+#   fast     lint, types, hermetic tool tests. No model, no secrets, no network.
+#            Runs on everything, including fork PRs. ~seconds.
+#   agent    the agent integration suite. Calls the model, so it needs a key and
+#            only runs where secrets are available. ~20s, well under a dollar.
+#   nightly  the full 199-example experiment with LLM judges and repetitions.
+#            Non-deterministic and comparatively expensive — never a PR gate.
+#
+# Judges never block a merge. Their output varies run to run: an earlier signal
+# here moved ~7 points on a single run and turned out to be sampling noise, so a
+# judge in a blocking gate would flake builds. They gate on the nightly
+# aggregate instead.
+
+on:
+  # `push` is limited to main so a PR branch does not run everything twice —
+  # `pull_request` already covers pre-merge, and push covers post-merge.
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: evals-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: lint, types, hermetic tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --dev
+
+      - name: ruff
+        run: uv run ruff check
+
+      # `ty`'s remaining diagnostics would each need a cast asserting something
+      # untrue, so it reports without blocking. A change in the count is the
+      # signal, not the count itself.
+      - name: ty (advisory)
+        run: uv run ty check || true
+
+      # No model, no network, no Phoenix. Covers both the agent's tools and the
+      # eval framework that gates them — the framework's own bugs have all been
+      # found in production so far, which is the argument for testing it here.
+      - name: hermetic tests
+        run: uv run pytest tests/test_tools.py tests/test_evals_framework.py -q
+
+  agent:
+    name: agent evals
+    runs-on: ubuntu-latest
+    needs: fast
+    # Secrets are unavailable to fork PRs, and this job cannot run without a
+    # model key. Skipping is correct; failing would punish outside contributors.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --dev
+
+      # Without this the job runs the whole suite and every case dies inside the
+      # Anthropic SDK with "Could not resolve authentication method" — 38 stack
+      # traces for one missing repository secret. Fail in one line instead, and
+      # say what to do about it.
+      - name: check for a model key
+        id: preflight
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "have_key=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "have_key=false" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ] \
+             && [ -n "${{ github.event.pull_request.head.repo.full_name }}" ]; then
+            echo "::notice::Fork PR — secrets are unavailable, so the agent evals are skipped."
+            echo "Tier A (lint, types, hermetic tests) still gated this change."
+            exit 0
+          fi
+          echo "::error::ANTHROPIC_API_KEY is not set for this repository."
+          echo "Add it under Settings -> Secrets and variables -> Actions."
+          echo "The agent evals call a real model and cannot run without it."
+          exit 1
+
+      - name: agent integration evals
+        if: steps.preflight.outputs.have_key == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PHOENIX_ENDPOINT: ${{ secrets.PHOENIX_ENDPOINT }}
+          PHOENIX_API_KEY: ${{ secrets.PHOENIX_API_KEY }}
+          # A full run rewrites its dataset to match the collected cases, so two
+          # branches sharing a name would prune each other's examples.
+          PHOENIX_TEST_DATASET: travel-agent-ci-${{ github.ref_name }}
+          # With no Phoenix reachable the suite still runs; it just records
+          # nothing. The eval gate must not inherit the observability
+          # platform's uptime.
+          PHOENIX_TEST_TRACKING: ${{ secrets.PHOENIX_ENDPOINT != '' }}
+        run: uv run pytest tests/evals -q -n auto
+
+  nightly:
+    name: full experiment
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --dev
+
+      - name: full golden-set experiment with judges
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PHOENIX_COLLECTOR_ENDPOINT: ${{ secrets.PHOENIX_ENDPOINT }}
+          # Without this the nightly tier silently fails to record against an
+          # authenticated Phoenix — and the nightly tier is the one that gates
+          # on judge aggregates.
+          PHOENIX_API_KEY: ${{ secrets.PHOENIX_API_KEY }}
+        run: |
+          uv run python -m evals.run_experiment \
+            --name "nightly-${{ github.run_number }}" \
+            --evaluators hallucination,recommendation_grounded,no_fabricated_flights,flight_direction \
+            --repetitions 3

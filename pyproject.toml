@@ -16,6 +16,7 @@ dependencies = [
     "pandas>=3.0.5",
     "pytest>=9.1.1",
     "python-dotenv==1.2.2",
+    "pyyaml>=6.0.3",
     "scikit-learn>=1.9.0",
     "uvicorn[standard]==0.51.0",
 ]
@@ -29,6 +30,14 @@ packages = ["agent", "backend", "common", "evals"]
 
 [dependency-groups]
 dev = [
+    "pytest-xdist>=3.8.0",
     "ruff>=0.16.5",
     "ty>=0.0.77",
 ]
+
+[tool.ty.src]
+# Airflow is the deployment's runtime, not a project dependency, so `dags/`
+# cannot type-check here. Excluding it keeps `ty`'s diagnostic count usable as
+# a signal — the number changing is what matters, and six permanent
+# unresolved-import errors would drown that out.
+exclude = ["dags"]
