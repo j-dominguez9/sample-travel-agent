@@ -26,6 +26,7 @@ class AgentConfig:
     alerting: dict[str, Any] = field(default_factory=dict)
     regression: dict[str, Any] = field(default_factory=dict)
     curation: dict[str, Any] = field(default_factory=dict)
+    cost: dict[str, Any] = field(default_factory=dict)
     path: Path | None = None
 
     @property

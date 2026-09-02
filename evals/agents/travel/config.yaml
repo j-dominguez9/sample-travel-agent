@@ -86,6 +86,20 @@ regression:
   # merged elsewhere — which CI structurally cannot see.
   drift_tolerance: 0.10
 
+# Discovery: "no existing dashboards, establish separate dashboard for this
+# (cost, token usage)". Phoenix computes cost natively from its own pricing
+# table, so this only says where to look and what counts as too expensive.
+cost:
+  # Where the judges' own spend lands. Reported next to agent spend because
+  # adopting this system is itself an operating cost the customer is taking on.
+  eval_project: evaluators
+  # Stated volume from the discovery call: ~1M conversations a year.
+  annual_conversations: 1000000
+  # No unit economic was given, so this is an assumption, not a requirement —
+  # set to roughly 3x the currently measured rate so it catches a step change
+  # rather than ordinary variation. Notifies; it is not an incident.
+  max_cost_per_conversation: 0.05
+
 curation:
   # Flagged production turns become candidate golden cases. Never merged
   # automatically: the customer requires a human in the loop for regressions.

@@ -94,6 +94,25 @@ one", which is exactly how a real user commits. `booking_limits_disclosed`
 monitors the control the way `no_unredacted_pii` monitors redaction, and is
 session-aware: a disclosure at turn 1 covers turn 3.
 
+Cost and token usage come from Phoenix's own pricing table rather than a second
+copy of the rates: `evals/core/cost.py` reads per-project cost over a window and
+expresses it per conversation, alongside what the evaluation stack itself costs.
+The monitoring DAG runs it as `cost_report`, and it is also a CLI:
+
+```bash
+uv run python -m evals.core.cost                # the agent's monitoring window
+uv run python -m evals.core.cost --window 1440  # last 24h
+```
+
+Phoenix's own Dashboards page (per project, with a project selector) covers
+totals, trends and the per-model split and is the better place to explore.
+What it cannot show is a *rate* — cost per conversation is spend divided by
+sessions, and Phoenix has no custom dashboards in this version — which is why
+those numbers live here. Judge calls are traced into their
+own project by `evals/core/tracing.py` — without that their spend is not
+recorded anywhere and the report reads `$0.00`, which looks like "free" rather
+than "not measured".
+
 Spans are redacted before export: email addresses, card numbers, phone numbers,
 national ID numbers and passport numbers are replaced with `[REDACTED_*]`
 markers by `common/redaction.py`, which wraps the OTLP exporter so it also

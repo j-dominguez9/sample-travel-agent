@@ -753,3 +753,59 @@ def test_real_disclosure_wordings_from_production_are_recognised() -> None:
         "that's something you'd need to take up with the airline.",
         message="I booked a flight through you last month and need a refund.",
     ) == 1.0
+
+
+# --------------------------------------------------------------------------
+# cost reporting
+# --------------------------------------------------------------------------
+
+def _cost_report(**over):
+    from evals.core import cost
+    base = {"agent": "travel", "window_minutes": 180, "conversations": 100,
+            "turns": 200, "agent_cost": 1.0, "agent_tokens": 1_000_000.0,
+            "eval_cost": 2.0, "eval_tokens": 500_000.0}
+    base.update(over)
+    return cost.CostReport(**base)
+
+
+def test_cost_is_expressed_per_conversation() -> None:
+    """The unit the customer asked about. Phoenix reports totals."""
+    r = _cost_report(agent_cost=5.0, conversations=100, turns=250)
+    assert r.cost_per_conversation == 0.05
+    assert r.cost_per_turn == 0.02
+
+
+def test_eval_overhead_is_reported_even_when_it_exceeds_the_agent() -> None:
+    """Adopting this system is itself an operating cost.
+
+    A cost view that reports only the agent hides the half of the bill the
+    customer takes on by running the evaluation stack.
+    """
+    r = _cost_report(agent_cost=1.0, eval_cost=2.44)
+    assert r.eval_overhead == 2.44
+    assert "evals cost more than the agent" in r.summary()
+
+
+def test_an_empty_window_reports_nothing_rather_than_dividing_by_zero() -> None:
+    r = _cost_report(conversations=0, turns=0, agent_cost=0.0, agent_tokens=0.0)
+    assert r.cost_per_conversation is None
+    assert "no traffic in the window" in r.summary()
+    assert r.breaches == []
+
+
+def test_cost_breaches_only_against_a_configured_ceiling() -> None:
+    """No unit economic was given, so absence of a ceiling must not alert."""
+    assert _cost_report(agent_cost=100.0).breaches == []
+    r = _cost_report(agent_cost=100.0, conversations=100, max_cost_per_conversation=0.05)
+    assert len(r.breaches) == 1 and "above the $0.0500 ceiling" in r.breaches[0]
+
+
+def test_projection_uses_the_stated_annual_volume() -> None:
+    r = _cost_report(agent_cost=1.0, conversations=100, annual_conversations=1_000_000)
+    assert r.projected_annual_cost == 10_000.0
+
+
+def test_a_project_with_no_traces_is_named_not_silently_zeroed() -> None:
+    """Under-reporting the bill is the one failure a cost view must not have."""
+    r = _cost_report(missing_projects=["evaluators"])
+    assert "'evaluators' has no traces" in r.summary()
