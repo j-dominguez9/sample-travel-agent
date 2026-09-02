@@ -8,9 +8,21 @@ dataset: travel-golden-v1
 agent_span_name: travel_agent
 
 monitoring:
-  schedule: "@hourly"
-  window_minutes: 60
-  limit: 200
+  # Three hours, not one. At production volume an hour is plenty, but the
+  # judges only grade the turns they apply to — 65% of traffic for the
+  # grounding judges, 35% for graceful_alternative — and below `min_sample`
+  # they report nothing at all. An hourly window that silences the four most
+  # valuable evaluators is worse than a three-hourly one that doesn't.
+  schedule: "0 */3 * * *"
+  window_minutes: 180
+  # SPANS, not turns: one turn is ~8 spans (agent + LLM + one per tool call).
+  # The previous 200 capped every sweep at ~25 turns regardless of traffic,
+  # which is what was actually starving the judges.
+  limit: 2000
+  # Cost ceiling on the LLM judges only; code evaluators still see every turn,
+  # because sampling an invariant like no_unredacted_pii defeats its purpose.
+  # A no-op below 150 turns, so it never eats into min_sample.
+  judge_max_turns: 150
   # Never alert on a thin sample. An earlier sweep put graceful_alternative at
   # n=2 and reported 50%; acting on that would be acting on one conversation.
   min_sample: 20
@@ -26,6 +38,13 @@ thresholds:
   # (coding-run:travel-agent-failure-taxonomy-2026-09-01).
   past_date_still_searched: {min_rate: 0.95}
   derived_totals_are_correct: {min_rate: 0.99}
+  # A single occurrence is an incident, not a trend — hence 1.0, and hence
+  # page_on below rather than a quiet notify.
+  no_unredacted_pii:       {min_rate: 1.0}
+  # Same reasoning. A user who thinks a seat is held and a deposit taken finds
+  # out at the airport, and nothing in the reply told them otherwise — so this
+  # is an invariant that pages, not a quality trend.
+  booking_limits_disclosed: {min_rate: 1.0}
   hallucination:           {max_rate: 0.05}   # minimize: flagged fraction
   recommendation_grounded: {min_rate: 0.90}
   tool_response_handling:  {min_rate: 0.85}
@@ -46,6 +65,8 @@ alerting:
     - no_fabricated_flights
     - hallucination
     - recommendation_grounded
+    - no_unredacted_pii
+    - booking_limits_disclosed
 
 regression:
   schedule: "0 3 * * *"

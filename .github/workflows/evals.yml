@@ -54,7 +54,7 @@ jobs:
       # eval framework that gates them — the framework's own bugs have all been
       # found in production so far, which is the argument for testing it here.
       - name: hermetic tests
-        run: uv run pytest tests/test_tools.py tests/test_evals_framework.py -q
+        run: uv run pytest tests/test_tools.py tests/test_evals_framework.py tests/test_redaction.py -q
 
   agent:
     name: agent evals

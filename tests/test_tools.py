@@ -142,3 +142,141 @@ def test_tools_expose_only_their_documented_fields() -> None:
     assert set(flight) == set(T.FLIGHT_FIELDS)
     hotel = search_hotels("Miami", "2026-10-05", "2026-10-09")[0]
     assert set(hotel) == set(T.HOTEL_FIELDS)
+
+
+# --------------------------------------------------------------------------
+# capability disclosure guardrail
+#
+# The trigger is "has this conversation been shown bookable options", not "did
+# the user use a booking word". The keyword version scored 18/18 on the traffic
+# set and 0/7 on phrasings it had not seen; these tests deliberately use the
+# phrasings it missed.
+# --------------------------------------------------------------------------
+
+FLIGHTS = [{"name": "search_flights", "output": [{"flight_number": "UA 512"}]}]
+NO_FLIGHTS = [{"name": "search_flights", "output": []}]
+WEATHER = [{"name": "get_weather", "output": {"high_f": 73}}]
+
+
+def test_showing_options_triggers_the_disclosure_without_a_booking_word() -> None:
+    """The case keyword matching could never reach."""
+    from common.capabilities import DISCLOSURE, ensure_disclosure
+
+    out = ensure_disclosure(
+        "What flights go from New York to Chicago on October 8?",
+        "Here are your options: United UA 512 departs 6:50am — $178.",
+        tool_calls=FLIGHTS,
+    )
+    assert out.startswith(DISCLOSURE)
+    assert "United UA 512" in out
+
+
+def test_a_later_confirmation_needs_no_second_disclosure() -> None:
+    """"I'll take it" after the conversation was already told."""
+    from common.capabilities import ensure_disclosure
+
+    reply = "United UA 512 it is — departs 6:50am."
+    assert ensure_disclosure("I'll take it.", reply, tool_calls=[],
+                             already_disclosed=True) == reply
+
+
+def test_an_empty_search_does_not_trigger_it() -> None:
+    """"No flights that day" cannot be mistaken for a held seat."""
+    from common.capabilities import ensure_disclosure
+
+    reply = "There are no flights from Denver to Miami on that date."
+    assert ensure_disclosure("Flights Denver to Miami?", reply,
+                             tool_calls=NO_FLIGHTS) == reply
+
+
+def test_weather_is_not_bookable() -> None:
+    from common.capabilities import ensure_disclosure
+
+    reply = "Tokyo will be 73F and rainy."
+    assert ensure_disclosure("Weather in Tokyo?", reply, tool_calls=WEATHER) == reply
+
+
+def test_an_explicit_request_with_nothing_to_show_still_discloses() -> None:
+    """The keyword path still earns its place when no search ran."""
+    from common.capabilities import DISCLOSURE, ensure_disclosure
+
+    out = ensure_disclosure("Can you change the name on my existing reservation?",
+                            "That is handled by the airline.", tool_calls=[])
+    assert out.startswith(DISCLOSURE)
+
+
+def test_guardrail_leaves_an_existing_disclosure_alone() -> None:
+    """No double-disclosing when the model already got it right."""
+    from common.capabilities import ensure_disclosure
+
+    reply = "I can't hold a flight or take a deposit. Here's what's available: UA 512, $178."
+    assert ensure_disclosure("Hold that flight and take a deposit.", reply,
+                             tool_calls=FLIGHTS) == reply
+
+
+def test_guardrail_and_its_evaluator_cannot_disagree() -> None:
+    """The monitor must pass anything the control produces.
+
+    If `booking_limits_disclosed` failed the guardrail's own output, the
+    invariant would page on every transactional turn forever.
+    """
+    from common.capabilities import ensure_disclosure
+    from evals.agents.travel.evaluators import booking_limits_disclosed
+
+    message = "What flights go from New York to Chicago?"
+    guarded = ensure_disclosure(message, "Here are your options: UA 512 — $178.",
+                                tool_calls=FLIGHTS)
+    score = booking_limits_disclosed.evaluate(
+        {"input": {"message": message}, "output": {"reply": guarded, "tool_calls": FLIGHTS}}
+    )[0].score
+    assert score == 1.0
+
+
+def test_evaluator_fails_options_shown_with_no_disclosure_anywhere() -> None:
+    from evals.agents.travel.evaluators import booking_limits_disclosed
+
+    res = booking_limits_disclosed.evaluate({
+        "input": {"message": "Flights to Chicago?", "turn_index": 1,
+                  "disclosed_by_turn": None},
+        "output": {"reply": "Here are your options: UA 512 — $178.",
+                   "tool_calls": FLIGHTS},
+    })[0]
+    assert res.score == 0.0 and res.label == "undisclosed"
+
+
+def test_evaluator_accepts_a_disclosure_made_earlier_in_the_session() -> None:
+    """Turn 3 is covered by what was said at turn 1."""
+    from evals.agents.travel.evaluators import booking_limits_disclosed
+
+    res = booking_limits_disclosed.evaluate({
+        "input": {"message": "Book me a hotel there for two nights.",
+                  "turn_index": 3, "disclosed_by_turn": 1},
+        "output": {"reply": "Here are the hotels in Chicago.", "tool_calls": []},
+    })[0]
+    assert res.score == 1.0 and res.label == "disclosed_earlier"
+
+
+def test_a_disclosure_made_later_does_not_excuse_an_earlier_turn() -> None:
+    """Being told at turn 4 does not help the user who acted at turn 2."""
+    from evals.agents.travel.evaluators import booking_limits_disclosed
+
+    res = booking_limits_disclosed.evaluate({
+        "input": {"message": "Flights to Chicago?", "turn_index": 2,
+                  "disclosed_by_turn": 4},
+        "output": {"reply": "Here are your options: UA 512 — $178.",
+                   "tool_calls": FLIGHTS},
+    })[0]
+    assert res.score == 0.0
+
+
+def test_implying_the_booking_happened_fails_even_with_a_disclosure() -> None:
+    """Worse than silence: the user acts on a seat that was never held."""
+    from evals.agents.travel.evaluators import booking_limits_disclosed
+
+    res = booking_limits_disclosed.evaluate({
+        "input": {"message": "Hold that flight.", "turn_index": 1,
+                  "disclosed_by_turn": 1},
+        "output": {"reply": "I can't process payments directly, but you're all set on UA 512.",
+                   "tool_calls": FLIGHTS},
+    })[0]
+    assert res.score == 0.0 and res.label == "implied_completion"

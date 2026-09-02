@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from phoenix.evals import LLM, bind_evaluator, create_classifier
@@ -50,6 +51,31 @@ _llm = LLM(provider="anthropic", model=JUDGE_MODEL)
 # Adapters: our task output -> the shapes the evaluators expect
 # --------------------------------------------------------------------------
 
+def today_line() -> str:
+    """The date context the agent itself was given, restated for the judge.
+
+    Prompt v4 injects today's date into the system prompt and instructs the
+    agent to search past dates rather than refuse them. The judges were never
+    given the same context, and it cost us: on the 2026-09-02 sweep both
+    `hallucination` and `tool_response_handling` failed the turn
+
+        User: ... any flights from New York on August 7, 2026?
+        Agent: That date is in the past, but here are the flights that were
+               available on August 7, 2026. For an upcoming early August trip ...
+
+    with the reasoning "August 7, 2026 is actually a future date". It is not —
+    the sweep ran on September 2nd. The agent was right and the judges marked
+    it wrong, because a judge with no clock cannot check a claim about the
+    calendar and guesses from its training cutoff instead.
+
+    This belongs in the transcript rather than in a template: it is not a
+    grading instruction, it is part of the context the agent genuinely had, and
+    a judge grading faithfulness should see exactly what the agent saw.
+    """
+    today = datetime.now(UTC).date()
+    return f"(Context: today's date is {today.isoformat()}, a {today.strftime('%A')}.)"
+
+
 def transcript(row: Mapping[str, Any]) -> str:
     """Render one turn as the conversation the assistant actually had access to.
 
@@ -59,7 +85,7 @@ def transcript(row: Mapping[str, Any]) -> str:
     """
     inp = row.get("input") or {}
     out = row.get("output") or {}
-    lines = [f"User: {inp.get('message', '')}"]
+    lines = [today_line(), f"User: {inp.get('message', '')}"]
     for call in out.get("tool_calls") or []:
         args = json.dumps(call.get("input"), sort_keys=True)
         result = json.dumps(call.get("output"), sort_keys=True)
@@ -71,11 +97,35 @@ def _reply(row: Mapping[str, Any]) -> str:
     return (row.get("output") or {}).get("reply") or ""
 
 
-def _first_call(row: Mapping[str, Any], field: str) -> str:
+def _all_calls(row: Mapping[str, Any], field: str) -> str:
+    """Every tool call's `field`, not just the first one.
+
+    This started as `_first_call` and it was quietly wrong. A turn here is
+    routinely several calls — "what's the weather while I'm there?" fans out to
+    one `get_weather` per night, and a weekend request calls `search_hotels`
+    and `search_flights` — and showing the judge only call #1 makes every fact
+    sourced from calls #2..n look invented. On the 2026-09-02 sweep that read
+    as the agent fabricating three days of Tokyo weather it had actually looked
+    up, one call each:
+
+        tool_result (call 1 only): {"date": "2026-05-04", "condition": "Rain"}
+        judge: "the agent fabricated weather for THREE additional dates"
+
+    Multi-tool turns scored 20% against 77.8% for single-tool ones, which is
+    the signature of an adapter bug rather than a behaviour: the agent does not
+    get worse when it calls two tools, the evidence does.
+    """
     calls = (row.get("output") or {}).get("tool_calls") or []
     if not calls:
         return ""
-    return json.dumps(calls[0].get(field), sort_keys=True)
+    if len(calls) == 1:
+        return json.dumps(calls[0].get(field), sort_keys=True)
+    # Keep the call's name alongside its payload — with several tools in play
+    # the judge otherwise cannot tell which result belongs to which request.
+    return json.dumps(
+        [{"tool": c.get("name"), field: c.get(field)} for c in calls],
+        sort_keys=True,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -96,9 +146,11 @@ hallucination = bind_evaluator(
 tool_response_handling = bind_evaluator(
     ToolResponseHandlingEvaluator(llm=_llm),
     {
-        "input": lambda r: (r.get("input") or {}).get("message", ""),
-        "tool_call": lambda r: _first_call(r, "input"),
-        "tool_result": lambda r: _first_call(r, "output"),
+        # Same clock the transcript carries — this judge sees the raw message
+        # rather than the rendered transcript, so it needs the date separately.
+        "input": lambda r: f"{today_line()}\nUser: {(r.get('input') or {}).get('message', '')}",
+        "tool_call": lambda r: _all_calls(r, "input"),
+        "tool_result": lambda r: _all_calls(r, "output"),
         "output": _reply,
     },
 )
@@ -220,7 +272,10 @@ recommendation_grounded = bind_evaluator(
     ),
     {
         "request": lambda r: (r.get("input") or {}).get("message", ""),
-        "results": lambda r: _first_call(r, "output"),
+        # Every call's results, for the same reason as tool_response_handling:
+        # a superlative ("the cheapest") is graded against the options actually
+        # found, and half the options are not a fair test of it.
+        "results": lambda r: _all_calls(r, "output"),
         "reply": _reply,
     },
 )
@@ -231,12 +286,37 @@ recommendation_grounded = bind_evaluator(
 # --------------------------------------------------------------------------
 
 def _no_results(rec: Mapping[str, Any]) -> bool:
-    """True when the turn had nothing to offer — no tool ran, or all came back
-    empty. `graceful_alternative` is only meaningful on these turns; run it on a
-    successful search and it correctly reports "this found flights", which as an
-    aggregate reads as a false alarm."""
+    """True when the turn had nothing to offer.
+
+    `graceful_alternative` is only meaningful on these turns; run it on a
+    successful search and it correctly reports "this found flights", which as
+    an aggregate reads as a false alarm.
+
+    Two ways a turn has nothing to offer:
+
+    * tools ran and every one came back empty;
+    * no tool ran because the request was outside travel planning at all
+      ("do I need a visa?", "what's the baggage allowance?").
+
+    The second used to be written as "no tool ran", and that swept in a third
+    case it should never have: a follow-up answered from the conversation
+    ("which of those is cheapest?"). Those call no tool either, and the judge
+    kept saying so — "the agent's reply actually found and offered a flight
+    option, so it did NOT fail to fulfill the request." Split by gate reason,
+    the intended population passed at 84.6% while the leaked one sat at 65.7%
+    and dragged the metric under its floor.
+
+    `turn_index` is what separates them, which is why the agent span now
+    carries it. An opening message with no tool call is a genuine out-of-scope
+    request; a later one is nearly always resolvable from what came before. On
+    older spans it is absent — those keep the previous behaviour rather than
+    being silently dropped from the denominator.
+    """
     calls = (rec.get("output") or {}).get("tool_calls") or []
-    return not calls or all(not c.get("output") for c in calls)
+    if calls:
+        return all(not c.get("output") for c in calls)
+    turn_index = (rec.get("input") or {}).get("turn_index")
+    return turn_index is None or turn_index == 1
 
 
 def _has_results(rec: Mapping[str, Any]) -> bool:

@@ -22,13 +22,15 @@ backend/
 ├── main.py     # FastAPI app
 └── tracing.py  # Phoenix / OpenTelemetry setup
 common/
-└── logging.py  # JSON-lines logging
+├── logging.py       # JSON-lines logging
+├── redaction.py     # strips PII from spans at export
+└── capabilities.py  # what the agent can't do, enforced in code
 data/
 ├── flights.json
 ├── hotels.json
 └── weather.json
 scripts/
-└── generate_traffic.py   # sends ~20 sample queries to the API
+└── generate_traffic.py   # sends 50 sample conversations to the API
 ```
 
 The model can call four tools:
@@ -71,6 +73,34 @@ Environment variables:
 | `ANTHROPIC_API_KEY` | yes | — | Anthropic API key |
 | `ANTHROPIC_MODEL` | no | `claude-haiku-4-5` | Model used by the agent |
 | `PHOENIX_COLLECTOR_ENDPOINT` | yes (API) | — | Phoenix collector, e.g. `http://localhost:6006`. The API refuses to start without it; the CLI doesn't need it. |
+
+Each turn's agent span carries `session.id` (the conversation id) and
+`travel_agent.turn_index`, so multi-turn conversations group into sessions in
+Phoenix and evaluators can tell an opening request from a follow-up. Note that
+Phoenix nests dotted attribute namespaces on read — `travel_agent.turn_index`
+comes back as `attributes.travel_agent = {"turn_index": N}`, while semantic
+conventions like `session.id` stay flat.
+
+The agent can search but not transact, and it says so. Two prompt versions
+tried to make it say so by instruction and both measured worse than no rule at
+all (72% -> 50% -> 53%), so the disclosure is a guardrail in
+`common/capabilities.py`, applied in `agent/loop.py`.
+
+It fires on **what the conversation has been shown**, not on what the user
+typed: once, the first time a search puts flights or hotels in front of someone.
+Intent detection by keyword was tried first and is not reliable enough — it
+missed "I'll take it", "Go ahead with the first option" and "Take the 6:50am
+one", which is exactly how a real user commits. `booking_limits_disclosed`
+monitors the control the way `no_unredacted_pii` monitors redaction, and is
+session-aware: a disclosure at turn 1 covers turn 3.
+
+Spans are redacted before export: email addresses, card numbers, phone numbers,
+national ID numbers and passport numbers are replaced with `[REDACTED_*]`
+markers by `common/redaction.py`, which wraps the OTLP exporter so it also
+covers spans created by the Anthropic instrumentor. Redaction is by pattern
+rather than by field, because the evaluation framework reads `input.value` and
+`output.value` — blanking those would satisfy the privacy requirement and leave
+nothing to evaluate.
 
 ## Usage
 
@@ -119,11 +149,17 @@ Conversations are held in memory and reset when the server restarts. `GET /healt
 
 ### Traffic generator
 
-With the API server running, send ~20 varied sample queries (including one multi-turn conversation):
+With the API server running, send 50 varied conversations (~55 turns, including
+several multi-turn ones):
 
 ```bash
 uv run python scripts/generate_traffic.py
+uv run python scripts/generate_traffic.py --repeat 2   # ~110 turns
 ```
+
+The mix is weighted so every evaluator clears its `min_sample` floor — about a
+third of the conversations end in nothing available or nothing in scope, which
+is what keeps `graceful_alternative` reportable.
 
 Point it at a different host with an argument or env var:
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -32,6 +33,25 @@ def _attr(row: Any, *names: str) -> Any:
     for n in names:
         if n in row and pd.notna(row[n]):
             return row[n]
+    return None
+
+
+def _nested(row: Any, namespace: str, key: str) -> Any:
+    """Read `<namespace>.<key>` from a span, however Phoenix chose to shape it.
+
+    Phoenix collapses a dotted attribute name into a nested object on the way
+    into the dataframe, so `travel_agent.turn_index` arrives as the column
+    `attributes.travel_agent` holding `{"turn_index": 1}` — not as the flat
+    column the name suggests. Attributes it knows as semantic conventions
+    (`session.id`) stay flat instead, so both shapes occur side by side on the
+    same span and reading only one silently yields None.
+    """
+    flat = _attr(row, f"attributes.{namespace}.{key}")
+    if flat is not None:
+        return flat
+    ns = _attr(row, f"attributes.{namespace}")
+    if isinstance(ns, dict):
+        return ns.get(key)
     return None
 
 
@@ -78,10 +98,20 @@ def reconstruct(spans: pd.DataFrame, agent_span_name: str = "travel_agent") -> l
             # "cannot evaluate" as a zero and drag every average down.
             skipped.append(span_id)
             continue
+        # Session identity travels inside `input` rather than beside it: the
+        # evaluators are bound to `{"input", "output"}` and the offline
+        # experiment path builds that dict itself, so anything an evaluator
+        # needs has to live where both paths can put it.
+        turn_index = _nested(agent, "travel_agent", "turn_index")
         records.append({
             "span_id": span_id,
             "trace_id": agent["context.trace_id"],
-            "input": {"message": request},
+            "session_id": _attr(agent, "attributes.session.id"),
+            "prompt_version": _nested(agent, "travel_agent", "prompt_version"),
+            "input": {
+                "message": request,
+                "turn_index": int(turn_index) if turn_index is not None else None,
+            },
             "output": {
                 "reply": reply,
                 "tool_calls": tool_calls,
@@ -89,14 +119,72 @@ def reconstruct(spans: pd.DataFrame, agent_span_name: str = "travel_agent") -> l
         })
     if skipped:
         print(f"  skipped {len(skipped)} span(s) with no recorded input/output")
+    _stamp_session_disclosure(records)
     return records
 
 
-def score(records: Iterable[dict], agent: str) -> pd.DataFrame:
-    """Run every online-capable evaluator over the reconstructed records."""
+def _stamp_session_disclosure(records: list[dict]) -> None:
+    """Record, per turn, the earliest turn in its session that disclosed.
+
+    Some properties are true of a conversation rather than a turn. "The agent
+    told this user it cannot book" is one: said at turn 1, it still holds at
+    turn 4, and an evaluator that only sees turn 4 would score a correct
+    conversation as a failure.
+
+    This resolves it here rather than in the evaluator, because it is derived
+    from the replies themselves — what the agent actually said, across the
+    session — and not from the guardrail reporting on its own work. A monitor
+    that reads the control's self-report cannot catch the control failing.
+    """
+    from common.capabilities import discloses
+
+    earliest: dict[Any, int] = {}
+    for rec in records:
+        session, turn = rec.get("session_id"), rec["input"].get("turn_index")
+        if session is None or turn is None:
+            continue
+        if discloses(rec["output"].get("reply") or ""):
+            earliest[session] = min(earliest.get(session, turn), turn)
+
+    for rec in records:
+        rec["input"]["disclosed_by_turn"] = earliest.get(rec.get("session_id"))
+
+
+def score(
+    records: Iterable[dict],
+    agent: str,
+    *,
+    judge_max_turns: int | None = None,
+    rng: random.Random | None = None,
+    registry: Any = None,
+) -> pd.DataFrame:
+    """Run every online-capable evaluator over the reconstructed records.
+
+    `judge_max_turns` caps how many turns the **LLM** evaluators see; the code
+    evaluators always run on everything. That asymmetry is the point. Code
+    evaluators are free, and the ones that matter most here are invariants —
+    `no_unredacted_pii` on a sampled 20% of traffic is not a privacy control.
+    Judges cost a model call per turn per judge, and they are *signals*: a rate
+    estimated on a random 150 turns is nearly as good as one over 3,000, at 5%
+    of the bill. At the customer's ~114 conversations/hour an uncapped sweep is
+    roughly 7,000 judge calls a day.
+
+    It is a ceiling, not a rate — below it nothing is sampled, so thin traffic
+    is never thinned further into the `min_sample` floor. The sample is drawn
+    once and shared by every judge, so their rates stay comparable to each
+    other; sampling per judge would have them grading different windows.
+
+    `registry` defaults to the global one; tests pass their own so that
+    exercising the sampling logic does not bill a real judge call per turn.
+    """
+    records = list(records)
+    judge_records = records
+    if judge_max_turns is not None and len(records) > judge_max_turns:
+        judge_records = (rng or random.Random()).sample(records, judge_max_turns)
+
     rows = []
-    for reg in REGISTRY.for_agent(agent, online=True):
-        for rec in records:
+    for reg in (registry or REGISTRY).for_agent(agent, online=True):
+        for rec in records if reg.kind == "code" else judge_records:
             if reg.applies is not None and not reg.applies(rec):
                 continue  # not meaningful for this turn
             try:
@@ -227,10 +315,18 @@ def sweep(
     since_minutes: int = 60,
     limit: int = 100,
     agent_span_name: str = "travel_agent",
+    judge_max_turns: int | None = None,
     dry_run: bool = False,
     client: Client | None = None,
 ) -> pd.DataFrame:
-    """Sample recent spans, evaluate them, and annotate them in place."""
+    """Sample recent spans, evaluate them, and annotate them in place.
+
+    `limit` counts **spans**, not turns — one turn is ~8 spans here (the agent
+    span, its LLM calls, and a span per tool call). Sizing it as if it were a
+    turn cap silently truncates the window: a sweep configured at 200 scored 26
+    turns and skipped every judge for falling under `min_sample`, which read as
+    thin traffic and was really the fetch cap.
+    """
     client = client or Client()
     start = datetime.now(UTC) - timedelta(minutes=since_minutes)
     spans = client.spans.get_spans_dataframe(
@@ -240,7 +336,7 @@ def sweep(
     if not records:
         return pd.DataFrame()
 
-    results = score(records, agent)
+    results = score(records, agent, judge_max_turns=judge_max_turns)
     if not dry_run and not results.empty:
         client.spans.log_span_annotations_dataframe(
             dataframe=results.dropna(subset=["score"]).set_index("span_id"),
