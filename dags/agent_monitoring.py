@@ -11,8 +11,10 @@ receiving them through XCom. That keeps each task independently re-runnable
 (retry `check_thresholds` without paying for the judges again) and avoids
 pushing DataFrames through a metadata database that isn't built for them.
 
-    sweep ─┬─ check_thresholds ── alert
-           └─ curate_candidates
+    sweep ─┬─ check_thresholds ─┬─ alert
+           ├─ diagnose ─────────┘
+           ├─ curate_candidates
+           └─ cost_report
 """
 
 from __future__ import annotations
@@ -46,11 +48,17 @@ def build(conf) -> object:
             The only task that calls a model. Its durable output is the
             annotations, not the return value.
             """
-            from evals.agents.travel import (  # noqa: F401  (registers)
-                evaluators,
-                judges,
-            )
-            from evals.core import monitor
+            from evals.core import agents as agent_modules
+
+            agent_modules.load(conf.agent)  # registers this agent's evaluators
+            from evals.core import monitor, tracing
+
+            # Trace the judges' own model calls so their cost is measurable.
+            # Without this the cost report shows eval spend as $0, which reads
+            # as "free" rather than "not recorded".
+            eval_project = (conf.cost or {}).get("eval_project")
+            if eval_project:
+                tracing.enable(eval_project)
 
             results = monitor.sweep(
                 agent=conf.agent,
@@ -66,8 +74,10 @@ def build(conf) -> object:
         @task
         def check_thresholds(swept: dict) -> dict:
             """Compare rates against config. Reads annotations back, never rescores."""
-            from evals.agents.travel import evaluators, judges  # noqa: F401
+            from evals.core import agents as agent_modules
             from evals.core import monitor, thresholds
+
+            agent_modules.load(conf.agent)
 
             scores = monitor.read_annotations(
                 project=conf.project,
@@ -95,9 +105,11 @@ def build(conf) -> object:
             """
             from datetime import UTC, datetime, timedelta
 
-            from evals.agents.travel import evaluators, judges  # noqa: F401
+            from evals.core import agents as agent_modules
             from evals.core import diagnose as dx
             from evals.core import monitor
+
+            agent_modules.load(conf.agent)
 
             window = int(conf.monitoring.get("window_minutes", 60))
             limit = int(conf.monitoring.get("limit", 200))
@@ -150,8 +162,10 @@ def build(conf) -> object:
             """
             from datetime import UTC, datetime, timedelta
 
-            from evals.agents.travel import evaluators, judges, truth  # noqa: F401
+            from evals.core import agents as agent_modules
             from evals.core import curate, monitor
+
+            modules = agent_modules.load(conf.agent)
 
             if not conf.curation.get("enabled", False):
                 return {"candidates": 0, "skipped": "curation disabled in config"}
@@ -170,7 +184,7 @@ def build(conf) -> object:
                 since_minutes=int(conf.monitoring.get("window_minutes", 60)),
                 limit=int(conf.monitoring.get("limit", 200)),
             )
-            candidates = curate.collect(records, scores, conf, truth)
+            candidates = curate.collect(records, scores, conf, modules.truth)
             print(curate.summary(candidates))
             dataset_id = curate.publish(candidates, conf)
             return {
@@ -179,9 +193,33 @@ def build(conf) -> object:
                 "dataset_id": dataset_id,
             }
 
+        @task
+        def cost_report(swept: dict) -> dict:
+            """Cost and token usage for the window, agent and evals separately.
+
+            Discovery asked for a dashboard covering cost and token usage.
+            Phoenix's own UI is the exploratory half; this is the half that runs
+            on a schedule and can breach a threshold — a dashboard nobody opens
+            reports a cost spike to nobody.
+
+            Depends on `swept` only for ordering: it must read Phoenix after the
+            judges have spent, or it reports the sweep's cost one run late.
+            """
+            from evals.core import cost as cost_mod
+
+            report = cost_mod.report(conf)
+            print(report.summary())
+            return {
+                "cost_per_conversation": report.cost_per_conversation,
+                "agent_cost": report.agent_cost,
+                "eval_cost": report.eval_cost,
+                "breaches": report.breaches,
+            }
+
         swept = sweep()
         alert(check_thresholds(swept), diagnose(swept))
         curate_candidates(swept)
+        cost_report(swept)
 
     return monitoring()
 

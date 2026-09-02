@@ -21,11 +21,16 @@ class AgentConfig:
     project: str
     dataset: str
     agent_span_name: str
+    #: Prose for the on-call triage prompt: what this agent does and what
+    #: tools it has. Optional, but a diagnosis written against the wrong
+    #: product is worse than one written against no description at all.
+    description: str = ""
     monitoring: dict[str, Any] = field(default_factory=dict)
     thresholds: dict[str, dict[str, float]] = field(default_factory=dict)
     alerting: dict[str, Any] = field(default_factory=dict)
     regression: dict[str, Any] = field(default_factory=dict)
     curation: dict[str, Any] = field(default_factory=dict)
+    cost: dict[str, Any] = field(default_factory=dict)
     path: Path | None = None
 
     @property

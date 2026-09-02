@@ -222,3 +222,57 @@ def partial_window_routes() -> list[tuple[str, str]]:
         if len({(f["available_from"], f["available_to"]) for f in legs}) > 1:
             out.append((origin, destination))
     return out
+
+
+def derive_expected(record: dict) -> tuple[dict, bool, str] | None:
+    """This agent's ground truth for a curated candidate, or None.
+
+    The framework hook (`evals.core.curate.derive_expected`) handles the cases
+    that are true of any agent; this handles the two travel tools whose correct
+    answer the fixtures can compute. Returning None means "I cannot derive this
+    one", and the caller falls back to human review — which is the right
+    default, because a wrong label in the golden set is worse than no label.
+    """
+    from evals.core.curate import is_iso_date
+
+    calls = (record.get("output") or {}).get("tool_calls") or []
+    if not calls:
+        return None
+    call = calls[0]
+    name, args = call.get("name"), (call.get("input") or {})
+
+    if name == "search_flights" and {"origin", "destination", "date"} <= set(args):
+        # `expected_flights` compares ISO strings lexicographically and never
+        # raises, so a malformed date silently matches nothing. Deriving from
+        # that would publish "there are no flights on this route" as ground
+        # truth when the real defect was the date the agent sent.
+        if not is_iso_date(args["date"]):
+            return ({}, True, f"agent sent a malformed date ({args['date']!r})")
+        flights = expected_flights(args["origin"], args["destination"], args["date"])
+        return (
+            {
+                "expected_tool": name,
+                "expected_args": args,
+                "expected_result_ids": sorted(f["flight_number"] for f in flights),
+                "expected_behavior": "answer" if flights else "empty",
+            },
+            False,
+            "derived from fixtures",
+        )
+
+    if name == "search_hotels" and {"city", "check_in"} <= set(args):
+        if not is_iso_date(args["check_in"]):
+            return ({}, True, f"agent sent a malformed date ({args['check_in']!r})")
+        hotels = expected_hotels(args["city"], args["check_in"])
+        return (
+            {
+                "expected_tool": name,
+                "expected_args": args,
+                "expected_result_ids": sorted(h["name"] for h in hotels),
+                "expected_behavior": "answer" if hotels else "empty",
+            },
+            False,
+            "derived from fixtures",
+        )
+
+    return None

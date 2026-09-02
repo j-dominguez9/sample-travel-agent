@@ -178,7 +178,16 @@ def evidence(clusters: list[Cluster], limit_turns: int = 4) -> str:
     return "\n".join(out)
 
 
-HYPOTHESIS_PROMPT = """You are helping an on-call engineer triage failing evaluations of an AI travel agent.
+#: Fallback when an agent's config carries no `description`. Deliberately
+#: contentless: a triage prompt that invents domain detail is worse than one
+#: that admits it has none, because the hypothesis will confidently reference
+#: tools the agent does not have.
+DEFAULT_AGENT_BRIEF = (
+    "No description was configured for this agent, so judge only from the "
+    "evidence below and do not assume what tools it has."
+)
+
+HYPOTHESIS_PROMPT = """You are helping an on-call engineer triage failing evaluations of an AI agent.
 
 Below is evidence from one monitoring window: which evaluators failed, what the
 failing turns have in common, the agent's replies, and the evaluators' own
@@ -188,10 +197,8 @@ explanations.
 {evidence}
 </evidence>
 
-The agent has four tools — search_flights, search_hotels, get_weather,
-create_itinerary — backed by fixed local data. Its system prompt tells it to
-give concrete options, avoid clarifying questions, and never mention internal
-systems or data sources.
+About this agent:
+{agent_brief}
 
 Consider all three possibilities before concluding, and say which you believe:
   AGENT      the agent genuinely behaved wrongly
@@ -211,8 +218,14 @@ PROPOSED: <one concrete change, naming the file or prompt section to edit>
 CHECK FIRST: <the cheapest thing to run to confirm before changing anything>"""
 
 
-def hypothesis(clusters: list[Cluster], *, model: str | None = None) -> str:
-    """One LLM call over the evidence. Explicitly a hypothesis, never a verdict."""
+def hypothesis(clusters: list[Cluster], *, model: str | None = None,
+               agent_brief: str | None = None) -> str:
+    """One LLM call over the evidence. Explicitly a hypothesis, never a verdict.
+
+    `agent_brief` comes from the agent's own config. It used to be hardcoded to
+    the travel agent's four tools, which meant the second agent onboarded would
+    have had its failures triaged against a description of a different product.
+    """
     if not clusters:
         return ""
     import anthropic
@@ -224,7 +237,10 @@ def hypothesis(clusters: list[Cluster], *, model: str | None = None) -> str:
         max_tokens=600,
         messages=[{
             "role": "user",
-            "content": HYPOTHESIS_PROMPT.format(evidence=evidence(clusters, limit_turns=6)),
+            "content": HYPOTHESIS_PROMPT.format(
+                evidence=evidence(clusters, limit_turns=6),
+                agent_brief=agent_brief or DEFAULT_AGENT_BRIEF,
+            ),
         }],
     )
     return "".join(b.text for b in response.content if b.type == "text").strip()
@@ -284,7 +300,7 @@ def digest(
             parts += [
                 "HYPOTHESIS (generated, unverified — check it against the evidence above)",
                 "=" * 60,
-                hypothesis(clusters),
+                hypothesis(clusters, agent_brief=getattr(config, 'description', None)),
             ]
         except Exception as exc:  # noqa: BLE001
             # The evidence is the load-bearing half. If the hypothesis call

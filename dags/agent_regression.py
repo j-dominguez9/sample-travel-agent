@@ -48,10 +48,9 @@ def build(conf) -> object:
             ds = ds or datetime.now(UTC).date().isoformat()
 
             import agent.loop as agent_loop
-            from evals.agents.travel import (  # noqa: F401  (registers)
-                evaluators,
-                judges,
-            )
+            from evals.core import agents as agent_modules
+
+            agent_modules.load(conf.agent)  # registers this agent's evaluators
             from evals.core import runner
 
             name = f"nightly-{conf.agent}-{ds}"
@@ -114,7 +113,9 @@ def build(conf) -> object:
             # moved it. Built only when there is drift, since it costs a call.
             digest_text = ""
             if drift:
-                from evals.agents.travel import evaluators, judges  # noqa: F401
+                from evals.core import agents as agent_modules
+
+                agent_modules.load(conf.agent)
                 from evals.core import diagnose as dx
 
                 records, scores = dx.from_experiment(

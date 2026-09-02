@@ -1,0 +1,68 @@
+# Agent two. This file and the directory it sits in are the entire cost of
+# onboarding an agent: the DAGs glob evals/agents/*/config.yaml, so both a
+# monitoring DAG and a regression DAG appear for `support` without a line
+# changing in dags/, evals/core/, or the travel agent.
+
+agent: support
+project: support-agent
+dataset: support-golden-v1
+agent_span_name: support_agent
+description: >
+  A post-booking support agent with two tools — lookup_booking, which finds a
+  booking by its six-character reference, and cancellation_policy, which
+  returns refund and change rules for a fare class. Both are backed by fixed
+  local data. It cannot cancel, rebook or refund anything, and its prompt tells
+  it to say so plainly, to state only what the tools returned, and never to
+  mention systems or records.
+
+monitoring:
+  # Lower volume than the travel agent for now, so a wider window is needed to
+  # reach a sample worth alerting on. Same knob, different value — which is the
+  # argument for these being config rather than constants.
+  schedule: "0 */6 * * *"
+  window_minutes: 360
+  limit: 2000
+  judge_max_turns: 150
+  min_sample: 10
+
+thresholds:
+  no_fabricated_reference: {min_rate: 0.99}
+  fees_match_policy:       {min_rate: 0.99}
+  no_internal_leak:        {min_rate: 0.95}
+  no_unredacted_pii:       {min_rate: 1.0}
+  hallucination:           {max_rate: 0.05}
+  tool_response_handling:  {min_rate: 0.85}
+
+alerting:
+  owners:
+    - head-of-product
+    - support-engineering
+  page_on:
+    # A wrong fee and a fabricated reference are what this agent gets wrong
+    # expensively — the traveller acts on both.
+    - no_fabricated_reference
+    - fees_match_policy
+    - no_unredacted_pii
+    - hallucination
+
+regression:
+  schedule: "30 3 * * *"
+  evaluators:
+    - hallucination
+    - no_fabricated_reference
+    - fees_match_policy
+  repetitions: 3
+  drift_tolerance: 0.10
+
+cost:
+  eval_project: evaluators
+  annual_conversations: 250000
+  max_cost_per_conversation: 0.05
+
+curation:
+  # No `derive_expected` hook for this agent yet, so every candidate needs a
+  # human to label it. That is the correct default: guessing ground truth is
+  # how a golden set quietly becomes wrong.
+  enabled: true
+  candidates_dataset: support-candidates
+  max_per_run: 25

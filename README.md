@@ -21,6 +21,9 @@ agent/
 backend/
 ├── main.py     # FastAPI app
 └── tracing.py  # Phoenix / OpenTelemetry setup
+support/            # agent two — post-booking support, same framework
+├── prompt.py   # its own prompt, disclosure wording and bookable tools
+└── tools.py    # lookup_booking, cancellation_policy
 common/
 ├── logging.py       # JSON-lines logging
 ├── redaction.py     # strips PII from spans at export
@@ -93,6 +96,25 @@ missed "I'll take it", "Go ahead with the first option" and "Take the 6:50am
 one", which is exactly how a real user commits. `booking_limits_disclosed`
 monitors the control the way `no_unredacted_pii` monitors redaction, and is
 session-aware: a disclosure at turn 1 covers turn 3.
+
+Cost and token usage come from Phoenix's own pricing table rather than a second
+copy of the rates: `evals/core/cost.py` reads per-project cost over a window and
+expresses it per conversation, alongside what the evaluation stack itself costs.
+The monitoring DAG runs it as `cost_report`, and it is also a CLI:
+
+```bash
+uv run python -m evals.core.cost                # the agent's monitoring window
+uv run python -m evals.core.cost --window 1440  # last 24h
+```
+
+Phoenix's own Dashboards page (per project, with a project selector) covers
+totals, trends and the per-model split and is the better place to explore.
+What it cannot show is a *rate* — cost per conversation is spend divided by
+sessions, and Phoenix has no custom dashboards in this version — which is why
+those numbers live here. Judge calls are traced into their
+own project by `evals/core/tracing.py` — without that their spend is not
+recorded anywhere and the report reads `$0.00`, which looks like "free" rather
+than "not measured".
 
 Spans are redacted before export: email addresses, card numbers, phone numbers,
 national ID numbers and passport numbers are replaced with `[REDACTED_*]`
@@ -167,6 +189,30 @@ Point it at a different host with an argument or env var:
 uv run python scripts/generate_traffic.py http://localhost:9000
 # or
 TRAVEL_AGENT_URL=http://localhost:9000 uv run python scripts/generate_traffic.py
+```
+
+## Multiple agents
+
+The framework is multi-tenant. Adding an agent is a directory under
+`evals/agents/<name>/` and a `config.yaml`; the DAGs glob for those, so both a
+monitoring DAG and a regression DAG appear without touching `dags/`.
+
+The split is: **prompt, tools and domain evaluators are per tenant; the
+mechanisms are shared.** Sweeping, thresholds, curation, diagnosis, cost, the
+registry and the DAGs are agent-agnostic, and so are the three evaluators that
+do not depend on a domain — PII, hallucination and tool-response handling —
+which live in `evals/core/library.py` and are registered per agent with that
+agent's own adapters.
+
+A second agent (`support`) exists because the claim needed testing. It found
+three places where travel-agent code was living in the framework: the triage
+prompt hardcoded the travel tools, `derive_expected` branched on
+`search_flights`, and the DAG tasks imported `evals.agents.travel` by name —
+which would have made the support DAG score zero turns and report success. All
+three are fixed, and `tests/test_evals_framework.py` pins them.
+
+```bash
+uv run python scripts/generate_support_traffic.py
 ```
 
 ## Notes

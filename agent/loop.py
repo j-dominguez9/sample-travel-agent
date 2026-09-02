@@ -95,12 +95,27 @@ def _assistant_texts(messages: list) -> Iterator[str]:
                 yield text
 
 
-def run_agent(messages: list) -> tuple[str, list]:
+def run_agent(
+    messages: list,
+    *,
+    tools: list | None = None,
+    execute: Any = None,
+    system: str | None = None,
+    disclosure: str | None = None,
+    bookable_tools: frozenset[str] | None = None,
+) -> tuple[str, list]:
     """Run one user turn through the tool-calling loop.
 
     `messages` must end with the latest user message. Returns the assistant's
     reply text and the updated message history.
+
+    The keyword arguments exist so a second agent can reuse this loop with its
+    own tools and prompt. They default to the travel agent, so every existing
+    caller is unaffected — the loop itself was never travel-specific, only its
+    imports were.
     """
+    tools = TOOLS if tools is None else tools
+    execute = execute_tool if execute is None else execute
     # Whether the conversation has already been told, read from history before
     # this turn adds to it.
     already_disclosed = any(discloses(t) for t in _assistant_texts(messages))
@@ -117,8 +132,8 @@ def run_agent(messages: list) -> tuple[str, list]:
         response = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=system_prompt(),
-            tools=TOOLS,
+            system=system or system_prompt(),
+            tools=tools,
             messages=messages,
         )
         messages.append({"role": "assistant", "content": response.content})
@@ -130,7 +145,7 @@ def run_agent(messages: list) -> tuple[str, list]:
         for block in response.content:
             if block.type == "tool_use":
                 with _tool_span(block.name, block.input) as span:
-                    result = execute_tool(block.name, block.input)
+                    result = execute(block.name, block.input)
                     _record_output(span, result)
                 calls.append({"name": block.name, "output": result})
                 tool_results.append(
@@ -150,7 +165,8 @@ def run_agent(messages: list) -> tuple[str, list]:
     # user use a booking word" — the sentence that puts a user at risk is
     # usually "I'll take it", which contains no such word.
     disclosed = ensure_disclosure(
-        last_user, reply, tool_calls=calls, already_disclosed=already_disclosed
+        last_user, reply, tool_calls=calls, already_disclosed=already_disclosed,
+        disclosure=disclosure, bookable_tools=bookable_tools,
     )
     if disclosed != reply:
         # Keep history equal to what the user actually saw. Otherwise the model

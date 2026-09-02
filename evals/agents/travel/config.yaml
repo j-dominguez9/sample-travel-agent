@@ -6,6 +6,13 @@ agent: travel
 project: travel-agent                 # Phoenix project carrying production traces
 dataset: travel-golden-v1
 agent_span_name: travel_agent
+description: >
+  A customer-facing travel agent with four tools — search_flights,
+  search_hotels, get_weather and create_itinerary — backed by fixed local data.
+  Its prompt tells it to give concrete options, avoid clarifying questions,
+  resolve relative dates itself, search past dates rather than refuse them, and
+  never mention internal systems or data sources. It cannot book or transact;
+  a guardrail adds that disclosure when the model omits it.
 
 monitoring:
   # Three hours, not one. At production volume an hour is plenty, but the
@@ -85,6 +92,20 @@ regression:
   # Catches drift with no code change — a provider model update, a prompt edit
   # merged elsewhere — which CI structurally cannot see.
   drift_tolerance: 0.10
+
+# Discovery: "no existing dashboards, establish separate dashboard for this
+# (cost, token usage)". Phoenix computes cost natively from its own pricing
+# table, so this only says where to look and what counts as too expensive.
+cost:
+  # Where the judges' own spend lands. Reported next to agent spend because
+  # adopting this system is itself an operating cost the customer is taking on.
+  eval_project: evaluators
+  # Stated volume from the discovery call: ~1M conversations a year.
+  annual_conversations: 1000000
+  # No unit economic was given, so this is an assumption, not a requirement —
+  # set to roughly 3x the currently measured rate so it catches a step change
+  # rather than ordinary variation. Notifies; it is not an incident.
+  max_cost_per_conversation: 0.05
 
 curation:
   # Flagged production turns become candidate golden cases. Never merged
