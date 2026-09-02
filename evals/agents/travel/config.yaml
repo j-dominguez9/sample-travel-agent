@@ -22,6 +22,10 @@ thresholds:
   no_fabricated_flights:   {min_rate: 0.99}
   weather_values_plausible: {min_rate: 0.99}
   no_internal_leak:        {min_rate: 0.95}
+  # Both from axial coding over production traces
+  # (coding-run:travel-agent-failure-taxonomy-2026-09-01).
+  past_date_still_searched: {min_rate: 0.95}
+  derived_totals_are_correct: {min_rate: 0.99}
   hallucination:           {max_rate: 0.05}   # minimize: flagged fraction
   recommendation_grounded: {min_rate: 0.90}
   tool_response_handling:  {min_rate: 0.85}

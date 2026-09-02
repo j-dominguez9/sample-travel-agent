@@ -400,3 +400,91 @@ def test_tool_span_attributes_survive_a_non_recording_span() -> None:
     # And end to end with whatever tracer this process actually has.
     with _tool_span("search_flights", {"origin": "New York"}) as span:
         _record_output(span, [{"flight_number": "DL 883"}])
+
+
+# --------------------------------------------------------------------------
+# evaluators added from axial coding over production traces
+# --------------------------------------------------------------------------
+
+def test_a_past_date_is_still_searched() -> None:
+    """Trace coding found the agent refusing one past date and serving another
+    in the same run — 'March 12, 2026' declined as past while 'April 20, 2026'
+    was searched. The policy now says search either way; this pins it."""
+    from evals.agents.travel.evaluators import past_date_still_searched as ev
+
+    refused = {"input": {"message": "Find me a flight from New York to Miami on March 12, 2026."},
+               "output": {"reply": "That date is in the past.", "tool_calls": []}}
+    assert ev.evaluate(refused)[0].score == 0.0
+
+    # A compliant call carries the requested date; an empty input would mean the
+    # date never reached the tool, which is the failure, not the pass.
+    searched = {"input": {"message": "Find me a flight from New York to Miami on March 12, 2026."},
+                "output": {"reply": "That date has passed, but here is what ran.",
+                           "tool_calls": [{"name": "search_flights",
+                                           "input": {"origin": "New York",
+                                                     "destination": "Miami",
+                                                     "date": "2026-03-12"},
+                                           "output": []}]}}
+    assert ev.evaluate(searched)[0].score == 1.0
+
+    future = {"input": {"message": "A flight on December 30, 2027."},
+              "output": {"reply": "Let me check.", "tool_calls": []}}
+    assert ev.evaluate(future)[0].score == 1.0, "a future date imposes no obligation here"
+
+    # Compliance is the requested date reaching a tool, not merely that some
+    # tool ran: get_weather also takes a date, so a tool-name check alone scored
+    # a refusal-plus-unrelated-call as compliant.
+    sidestep = {"input": {"message": "A flight on March 12, 2026."},
+                "output": {"reply": "That date is past. Here is the weather.",
+                           "tool_calls": [{"name": "get_weather",
+                                           "input": {"city": "Miami", "date": "2026-09-05"},
+                                           "output": {}}]}}
+    assert ev.evaluate(sidestep)[0].score == 0.0
+
+    substituted = {"input": {"message": "A flight on March 12, 2026."},
+                   "output": {"reply": "Searching 2027 instead.",
+                              "tool_calls": [{"name": "search_flights",
+                                              "input": {"date": "2027-03-12"}, "output": []}]}}
+    assert ev.evaluate(substituted)[0].score == 0.0, "silently searching a different date is a refusal"
+
+
+def test_a_stated_total_must_match_the_arithmetic() -> None:
+    """Derived values were the largest taxonomy category. Sound arithmetic is
+    fine; wrong arithmetic reads identically to a customer."""
+    from evals.agents.travel.evaluators import derived_totals_are_correct as ev
+
+    call = {"name": "search_hotels",
+            "input": {"city": "Paris", "check_in": "2026-06-10", "check_out": "2026-06-14"},
+            "output": [{"name": "Lumiere", "price_per_night_usd": 385, "rating": 4.7}]}
+
+    def score(reply: str) -> float:
+        return ev.evaluate({"output": {"reply": reply, "tool_calls": [call]}})[0].score
+
+    assert score("Lumiere $385/night — $1,540 for 4 nights.") == 1.0
+    assert score("Lumiere $385/night — $1,155 for 4 nights.") == 0.0, "wrong total"
+    assert score("Lumiere is $410/night.") == 0.0, "rate absent from the tool output"
+    assert score("Lumiere $385/night, rated 4.7 out of 5.") == 1.0, "a rating is not money"
+
+
+def test_totals_pair_rates_with_their_own_stay_length() -> None:
+    """Rates and nights were pooled across calls, which failed correct replies
+    two ways: a total from an earlier call's date range looked fabricated, and
+    one malformed call reset the night count, dropping every valid total."""
+    from evals.agents.travel.evaluators import derived_totals_are_correct as ev
+
+    def hotels(ci, co, rate):
+        return {"name": "search_hotels",
+                "input": {"city": "X", "check_in": ci, "check_out": co},
+                "output": [{"name": "H", "price_per_night_usd": rate}]}
+
+    def score(reply, calls):
+        return ev.evaluate({"output": {"reply": reply, "tool_calls": calls}})[0].score
+
+    two = [hotels("2026-06-10", "2026-06-14", 385), hotels("2026-08-07", "2026-08-09", 300)]
+    assert score("$385/night — $1,540 for 4 nights. $300/night — $600 for 2 nights.", two) == 1.0
+
+    malformed = [hotels("2026-06-10", "2026-06-14", 385),
+                 {"name": "search_hotels", "input": {"city": "X"}, "output": []}]
+    assert score("$385/night — $1,540 for 4 nights.", malformed) == 1.0
+
+    assert score("$385/night — $1,155 for 4 nights.", [hotels("2026-06-10", "2026-06-14", 385)]) == 0.0
