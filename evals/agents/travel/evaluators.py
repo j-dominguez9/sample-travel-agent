@@ -12,6 +12,8 @@ Each evaluator reads the task output produced by `evals.core.runner.run_turn`:
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
+from datetime import date as date_cls
 from typing import Any
 
 from phoenix.evals import create_evaluator
@@ -23,6 +25,9 @@ AGENT = "travel"
 
 #: Flight numbers look like "DL 883" / "B6 1029"; used to spot fabricated ones.
 FLIGHT_NUM = re.compile(r"\b([A-Z]{2}|[A-Z]\d)\s?(\d{2,4})\b")
+
+#: Argument names that carry a date but are not spelled "date".
+_DATE_KEYS = {"check_in", "check_out"}
 
 #: Every carrier code the fixtures actually contain. A citation is only judged
 #: when it uses one of these, so real prose can't trip the check.
@@ -231,3 +236,108 @@ def stays_in_scope(output: Any, expected: dict) -> bool:
     if expected.get("expected_behavior") != "out_of_scope":
         return True
     return len(_calls(output)) == 0
+
+
+# --------------------------------------------------------------------------
+# From axial coding over 24 production traces
+# (coding-run:travel-agent-failure-taxonomy-2026-09-01)
+#
+# Two categories in that taxonomy had no evaluator. Both are added here rather
+# than as judges because both are decidable from the turn itself.
+# --------------------------------------------------------------------------
+
+#: "March 12, 2026" / "2026-03-12" — the two shapes real requests actually use.
+_EXPLICIT_DATE = re.compile(
+    r"\b(\d{4}-\d{2}-\d{2})\b"
+    r"|\b(January|February|March|April|May|June|July|August|September|October|"
+    r"November|December)\s+(\d{1,2}),?\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+_MONTHS = {m: i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july", "august",
+     "september", "october", "november", "december"], start=1)}
+
+
+def _requested_dates(message: str) -> list[date_cls]:
+    out = []
+    for iso, month, day, year in _EXPLICIT_DATE.findall(message):
+        try:
+            out.append(date_cls.fromisoformat(iso) if iso
+                       else date_cls(int(year), _MONTHS[month.lower()], int(day)))
+        except ValueError:
+            continue
+    return out
+
+
+@REGISTRY.register(
+    agent=AGENT, name="past_date_still_searched", kind="code", mode="invariant",
+    online=True,
+    description="A date that has already passed is still searched. Trace coding "
+                "found the agent refusing 'March 12, 2026' as past while serving "
+                "'April 20, 2026' in the same run — same policy, opposite answers.",
+)
+@create_evaluator(name="past_date_still_searched", kind="code")
+def past_date_still_searched(input: Any, output: Any) -> bool:
+    message = (input or {}).get("message", "") if isinstance(input, dict) else str(input or "")
+    past = [d for d in _requested_dates(message) if d < datetime.now(UTC).date()]
+    if not past:
+        return True
+    # The prompt's rule: search it anyway and note that it has passed. A refusal
+    # leaves the user with nothing, and refusing only sometimes is worse still.
+    #
+    # Compliance is the requested date reaching a tool — not merely that some
+    # tool ran. An agent that declines a past-dated flight search and calls
+    # get_weather has still refused the request, and `get_weather` takes a date,
+    # so a tool-name check alone would score that as compliant.
+    wanted = {d.isoformat() for d in past}
+    for call in _calls(output):
+        args = call.get("input") or {}
+        if not isinstance(args, dict):
+            continue
+        if wanted & {str(v) for k, v in args.items() if "date" in k or k in _DATE_KEYS}:
+            return True
+    return False
+
+
+@REGISTRY.register(
+    agent=AGENT, name="derived_totals_are_correct", kind="code", mode="invariant",
+    online=True,
+    description="A stated total equals a returned nightly rate times the nights "
+                "booked. The largest taxonomy category was values computed from "
+                "tool output and presented as fact — sound arithmetic is fine, "
+                "wrong arithmetic reads exactly the same to a customer.",
+)
+@create_evaluator(name="derived_totals_are_correct", kind="code")
+def derived_totals_are_correct(output: Any) -> bool:
+    calls = _calls(output, "search_hotels")
+    if not calls:
+        return True
+    reply = (output or {}).get("reply", "") if isinstance(output, dict) else ""
+
+    # Rates and stay length are paired PER CALL. Pooling them was wrong twice
+    # over: two searches with different date ranges made a total from the first
+    # look fabricated, and one malformed call reset `nights` to 0, dropping
+    # every legitimate total from the set.
+    rates: set[int] = set()
+    legitimate: set[int] = set()
+    for call in calls:
+        args, res = call.get("input") or {}, call.get("output")
+        if not isinstance(res, list):
+            continue
+        call_rates = {int(h["price_per_night_usd"]) for h in res
+                      if isinstance(h, dict) and "price_per_night_usd" in h}
+        rates |= call_rates
+        legitimate |= call_rates
+        try:
+            nights = (date_cls.fromisoformat(str(args["check_out"]))
+                      - date_cls.fromisoformat(str(args["check_in"]))).days
+        except (KeyError, TypeError, ValueError):
+            continue  # this call contributes rates but no derivable total
+        if nights > 0:
+            legitimate |= {r * nights for r in call_rates}
+    if not rates:
+        return True
+    cited = {int(m.replace(",", "")) for m in re.findall(r"\$([\d,]+)", reply)}
+    # Ignore anything below the cheapest rate: ratings, counts and night tallies
+    # are not money, and a total is never smaller than one night.
+    return all(v in legitimate for v in cited if v >= min(rates))

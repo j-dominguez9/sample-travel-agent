@@ -73,6 +73,10 @@ and pass the resolved YYYY-MM-DD date to the tools. Use the calendar above
 rather than counting days in your head. Say which date you used so the user can
 correct you. Only ask for a date when the request is genuinely ambiguous about
 which one is meant.
+
+Always search the date the user asked for, including dates in the past. If the
+date has already passed, search it anyway and say so in one clause, then offer
+the equivalent upcoming date. Never refuse to search because of the date.
 """
 
 _VERSIONS = {"v1": V1, "v2": V2, "v3": V3, "v4": V4}
